@@ -1,56 +1,26 @@
 {
-  "Comment": "HashiCorp RAG pipeline: CodeBuild ingestion -> Bedrock Knowledge Base sync -> validation",
+  "Comment": "HashiCorp RAG pipeline: CodeBuild ingestion -> Kendra sync -> validation",
   "StartAt": "Init",
   "States": {
     "Init": {
       "Type": "Pass",
       "Parameters": {
-        "knowledge_base_id.$": "$.knowledge_base_id",
-        "data_source_id.$": "$.data_source_id",
+        "kendra_index_id.$": "$.kendra_index_id",
+        "kendra_data_source_id.$": "$.kendra_data_source_id",
         "bucket_name.$": "$.bucket_name",
         "repo_url.$": "$.repo_url",
         "region.$": "$.region",
         "validationQueries": [
-          {
-            "topic": "terraform-provider",
-            "query": "How do I configure the AWS provider in Terraform?"
-          },
-          {
-            "topic": "vault",
-            "query": "How do I generate dynamic database credentials using HashiCorp Vault?"
-          },
-          {
-            "topic": "consul",
-            "query": "How do I set up mTLS between services using Consul Connect?"
-          },
-          {
-            "topic": "nomad",
-            "query": "How do I define a Nomad job specification for a Docker container?"
-          },
-          {
-            "topic": "sentinel",
-            "query": "How do I write a Sentinel policy to restrict resource creation in Terraform?"
-          },
-          {
-            "topic": "packer",
-            "query": "How do I build an AMI with Packer using an HCL template?"
-          },
-          {
-            "topic": "terraform-module",
-            "query": "What is the structure of a reusable Terraform module?"
-          },
-          {
-            "topic": "github-issue",
-            "query": "What are common issues when upgrading the Terraform AWS provider?"
-          },
-          {
-            "topic": "discuss-thread",
-            "query": "How do I troubleshoot Terraform state locking errors?"
-          },
-          {
-            "topic": "blog-post",
-            "query": "What new features were announced for HashiCorp products?"
-          }
+          { "topic": "terraform-provider", "query": "How do I configure the AWS provider in Terraform?" },
+          { "topic": "vault",              "query": "How do I generate dynamic database credentials using HashiCorp Vault?" },
+          { "topic": "consul",             "query": "How do I set up mTLS between services using Consul Connect?" },
+          { "topic": "nomad",              "query": "How do I define a Nomad job specification for a Docker container?" },
+          { "topic": "sentinel",           "query": "How do I write a Sentinel policy to restrict resource creation in Terraform?" },
+          { "topic": "packer",             "query": "How do I build an AMI with Packer using an HCL template?" },
+          { "topic": "terraform-module",   "query": "What is the structure of a reusable Terraform module?" },
+          { "topic": "github-issue",       "query": "What are common issues when upgrading the Terraform AWS provider?" },
+          { "topic": "discuss-thread",     "query": "How do I troubleshoot Terraform state locking errors?" },
+          { "topic": "blog-post",          "query": "What new features were announced for HashiCorp products?" }
         ]
       },
       "Next": "StartBuild"
@@ -62,16 +32,8 @@
       "Parameters": {
         "ProjectName": "${codebuild_project_name}",
         "EnvironmentVariablesOverride": [
-          {
-            "Name": "RAG_BUCKET",
-            "Value.$": "$.bucket_name",
-            "Type": "PLAINTEXT"
-          },
-          {
-            "Name": "REPO_URL",
-            "Value.$": "$.repo_url",
-            "Type": "PLAINTEXT"
-          }
+          { "Name": "RAG_BUCKET", "Value.$": "$.bucket_name", "Type": "PLAINTEXT" },
+          { "Name": "REPO_URL",   "Value.$": "$.repo_url",    "Type": "PLAINTEXT" }
         ]
       },
       "ResultPath": "$.buildResult",
@@ -90,7 +52,7 @@
           "ResultPath": "$.error"
         }
       ],
-      "Next": "StartIngestionJob"
+      "Next": "StartSync"
     },
 
     "BuildFailed": {
@@ -99,100 +61,149 @@
       "Cause": "CodeBuild project failed after retries — check CloudWatch Logs for details."
     },
 
-    "StartIngestionJob": {
+    "StartSync": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:bedrockagent:startIngestionJob",
+      "Resource": "arn:aws:states:::aws-sdk:kendra:startDataSourceSyncJob",
       "Parameters": {
-        "KnowledgeBaseId.$": "$.knowledge_base_id",
-        "DataSourceId.$": "$.data_source_id"
+        "Id.$":      "$.kendra_data_source_id",
+        "IndexId.$": "$.kendra_index_id"
       },
-      "ResultPath": "$.ingestionResult",
-      "Next": "WaitForIngestion"
+      "ResultPath": "$.syncResult",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "SyncFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "WaitForSync"
     },
 
-    "WaitForIngestion": {
+    "WaitForSync": {
       "Type": "Wait",
-      "Seconds": 30,
-      "Next": "GetIngestionStatus"
+      "Seconds": 60,
+      "Next": "ListSyncJobs"
     },
 
-    "GetIngestionStatus": {
+    "ListSyncJobs": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:bedrockagent:getIngestionJob",
+      "Resource": "arn:aws:states:::aws-sdk:kendra:listDataSourceSyncJobs",
       "Parameters": {
-        "KnowledgeBaseId.$": "$.knowledge_base_id",
-        "DataSourceId.$": "$.data_source_id",
-        "IngestionJobId.$": "$.ingestionResult.IngestionJob.IngestionJobId"
+        "Id.$":      "$.kendra_data_source_id",
+        "IndexId.$": "$.kendra_index_id"
       },
-      "ResultPath": "$.ingestionStatus",
-      "Next": "CheckIngestionStatus"
+      "ResultPath": "$.syncStatus",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "SyncFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CheckHistoryPresent"
     },
 
-    "CheckIngestionStatus": {
+    "CheckHistoryPresent": {
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "$.ingestionStatus.IngestionJob.Status",
-          "StringEquals": "COMPLETE",
+          "Variable": "$.syncStatus.History[0]",
+          "IsPresent": true,
+          "Next": "CheckSyncStatus"
+        }
+      ],
+      "Default": "WaitForSync"
+    },
+
+    "CheckSyncStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.syncStatus.History[0].Status",
+          "StringEquals": "SUCCEEDED",
           "Next": "ValidateRetrieval"
         },
         {
-          "Variable": "$.ingestionStatus.IngestionJob.Status",
+          "Variable": "$.syncStatus.History[0].Status",
+          "StringEquals": "INCOMPLETE",
+          "Next": "ValidateRetrieval"
+        },
+        {
+          "Variable": "$.syncStatus.History[0].Status",
           "StringEquals": "FAILED",
-          "Next": "IngestionFailed"
+          "Next": "SyncFailed"
+        },
+        {
+          "Variable": "$.syncStatus.History[0].Status",
+          "StringEquals": "ABORTED",
+          "Next": "SyncFailed"
         }
       ],
-      "Default": "WaitForIngestion"
+      "Default": "WaitForSync"
     },
 
-    "IngestionFailed": {
+    "SyncFailed": {
       "Type": "Fail",
-      "Error": "IngestionFailed",
-      "Cause": "Bedrock Knowledge Base ingestion job failed — check ingestionStatus for details."
+      "Error": "KendraSyncFailed",
+      "Cause": "Kendra data source sync job failed — check CloudWatch Logs for details."
     },
 
     "ValidateRetrieval": {
       "Type": "Map",
       "ItemsPath": "$.validationQueries",
       "ItemSelector": {
-        "KnowledgeBaseId.$": "$.knowledge_base_id",
-        "Topic.$": "$$.Map.Item.Value.topic",
+        "IndexId.$":   "$$.Execution.Input.kendra_index_id",
+        "Topic.$":     "$$.Map.Item.Value.topic",
         "QueryText.$": "$$.Map.Item.Value.query"
       },
-      "MaxConcurrency": 5,
+      "MaxConcurrency": 1,
       "Iterator": {
         "StartAt": "RunQuery",
         "States": {
           "RunQuery": {
             "Type": "Task",
-            "Resource": "arn:aws:states:::aws-sdk:bedrockagentruntime:retrieve",
+            "Resource": "arn:aws:states:::aws-sdk:kendra:query",
             "Parameters": {
-              "KnowledgeBaseId.$": "$.KnowledgeBaseId",
-              "RetrievalQuery": {
-                "Text.$": "$.QueryText"
-              },
-              "RetrievalConfiguration": {
-                "VectorSearchConfiguration": {
-                  "NumberOfResults": 5
-                }
-              }
+              "IndexId.$":   "$.IndexId",
+              "QueryText.$": "$.QueryText"
             },
-            "ResultPath": "$.retrievalResult",
+            "ResultPath": "$.queryResult",
+            "Retry": [
+              {
+                "ErrorEquals": ["Kendra.ThrottlingException", "States.TaskFailed"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 5,
+                "BackoffRate": 2
+              }
+            ],
             "End": true
           }
         }
       },
       "ResultPath": "$.validationResults",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "ValidationFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "PipelineComplete"
+    },
+
+    "ValidationFailed": {
+      "Type": "Fail",
+      "Error": "KendraQueryFailed",
+      "Cause": "Kendra validation queries failed — check CloudWatch Logs for details."
     },
 
     "PipelineComplete": {
       "Type": "Pass",
       "Parameters": {
         "status": "SUCCEEDED",
-        "knowledge_base_id.$": "$.knowledge_base_id",
-        "data_source_id.$": "$.data_source_id",
-        "ingestion_job_id.$": "$.ingestionResult.IngestionJob.IngestionJobId"
+        "kendra_index_id.$":       "$.kendra_index_id",
+        "kendra_data_source_id.$": "$.kendra_data_source_id",
+        "sync_execution_id.$":     "$.syncResult.ExecutionId"
       },
       "End": true
     }

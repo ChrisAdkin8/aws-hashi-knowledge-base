@@ -8,6 +8,21 @@ output "rag_bucket_arn" {
   value       = aws_s3_bucket.rag_docs.arn
 }
 
+output "kendra_index_id" {
+  description = "Kendra index ID."
+  value       = aws_kendra_index.main.id
+}
+
+output "kendra_index_arn" {
+  description = "Kendra index ARN."
+  value       = aws_kendra_index.main.arn
+}
+
+output "kendra_data_source_id" {
+  description = "Kendra S3 data source ID."
+  value       = local.kendra_data_source_id
+}
+
 output "state_machine_arn" {
   description = "ARN of the Step Functions state machine."
   value       = aws_sfn_state_machine.rag_pipeline.arn
@@ -26,24 +41,4 @@ output "codebuild_project_arn" {
 output "codebuild_role_arn" {
   description = "ARN of the CodeBuild execution IAM role."
   value       = aws_iam_role.codebuild.arn
-}
-
-output "bedrock_kb_role_arn" {
-  description = "ARN of the Bedrock Knowledge Base execution IAM role. Pass to create_knowledge_base.py."
-  value       = aws_iam_role.bedrock_kb.arn
-}
-
-output "opensearch_collection_arn" {
-  description = "ARN of the OpenSearch Serverless collection. Pass to create_knowledge_base.py."
-  value       = aws_opensearchserverless_collection.vectors.arn
-}
-
-output "opensearch_collection_endpoint" {
-  description = "OpenSearch Serverless collection endpoint URL."
-  value       = aws_opensearchserverless_collection.vectors.collection_endpoint
-}
-
-output "effective_embedding_model_arn" {
-  description = "Resolved Bedrock embedding model ARN (region-specific)."
-  value       = local.embedding_model_arn
 }

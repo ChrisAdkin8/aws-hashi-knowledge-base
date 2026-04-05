@@ -3,56 +3,63 @@
 #
 # Usage:
 #   scripts/run_pipeline.sh \
-#     --state-machine-arn arn:aws:states:us-west-2:123456789012:stateMachine:rag-hashicorp-pipeline \
-#     --region us-west-2 \
-#     --knowledge-base-id ABCDEFGHIJ \
-#     --data-source-id KLMNOPQRST \
-#     --bucket-name hashicorp-rag-docs-a1b2c3d4 \
+#     --state-machine-arn arn:aws:states:us-east-1:123456789012:stateMachine:rag-hashicorp-pipeline \
+#     --region us-east-1 \
+#     --kendra-index-id ABCDEFGHIJ \
+#     --kendra-data-source-id KLMNOPQRST \
+#     --bucket-name hashicorp-rag-docs-us-east-1-a1b2c3d4 \
 #     --repo-url https://github.com/org/repo \
 #     [--wait]
 set -euo pipefail
 
-REGION="us-west-2"
+REGION="us-east-1"
 STATE_MACHINE_ARN=""
-KB_ID=""
-DS_ID=""
+KENDRA_INDEX_ID=""
+KENDRA_DS_ID=""
 BUCKET_NAME=""
 REPO_URL=""
 WAIT=false
 POLL_INTERVAL=30
 
 usage() {
-  echo "Usage: $0 --state-machine-arn ARN --knowledge-base-id ID --data-source-id ID --bucket-name NAME --repo-url URL [--region REGION] [--wait]"
+  echo "Usage: $0 --state-machine-arn ARN --kendra-index-id ID --kendra-data-source-id ID --bucket-name NAME --repo-url URL [--region REGION] [--wait]"
   exit 1
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --state-machine-arn)  STATE_MACHINE_ARN="$2"; shift 2 ;;
-    --region)             REGION="$2";            shift 2 ;;
-    --knowledge-base-id)  KB_ID="$2";             shift 2 ;;
-    --data-source-id)     DS_ID="$2";             shift 2 ;;
-    --bucket-name)        BUCKET_NAME="$2";       shift 2 ;;
-    --repo-url)           REPO_URL="$2";          shift 2 ;;
-    --wait)               WAIT=true;              shift 1 ;;
-    -h|--help)            usage ;;
+    --state-machine-arn)     STATE_MACHINE_ARN="$2"; shift 2 ;;
+    --region)                REGION="$2";            shift 2 ;;
+    --kendra-index-id)       KENDRA_INDEX_ID="$2";   shift 2 ;;
+    --kendra-data-source-id) KENDRA_DS_ID="$2";      shift 2 ;;
+    --bucket-name)           BUCKET_NAME="$2";       shift 2 ;;
+    --repo-url)              REPO_URL="$2";          shift 2 ;;
+    --wait)                  WAIT=true;              shift 1 ;;
+    -h|--help)               usage ;;
     *) echo "Unknown argument: $1"; usage ;;
   esac
 done
 
-if [[ -z "${STATE_MACHINE_ARN}" || -z "${KB_ID}" || -z "${DS_ID}" ]]; then
-  echo "ERROR: --state-machine-arn, --knowledge-base-id, and --data-source-id are required"
+if [[ -z "${STATE_MACHINE_ARN}" || -z "${KENDRA_INDEX_ID}" || -z "${KENDRA_DS_ID}" ]]; then
+  echo "ERROR: --state-machine-arn, --kendra-index-id, and --kendra-data-source-id are required"
   usage
 fi
+
+# Derive the actual SFN region from the ARN (format: arn:aws:states:<region>:<acct>:stateMachine:<name>)
+SFN_REGION=$(echo "${STATE_MACHINE_ARN}" | cut -d: -f4)
+if [[ -z "${SFN_REGION}" ]]; then
+  SFN_REGION="${REGION}"
+fi
+echo "Step Functions region: ${SFN_REGION}"
 
 INPUT_JSON=$(python3 -c "
 import json
 print(json.dumps({
-  'knowledge_base_id': '${KB_ID}',
-  'data_source_id':    '${DS_ID}',
-  'bucket_name':       '${BUCKET_NAME}',
-  'repo_url':          '${REPO_URL}',
-  'region':            '${REGION}',
+  'kendra_index_id':       '${KENDRA_INDEX_ID}',
+  'kendra_data_source_id': '${KENDRA_DS_ID}',
+  'bucket_name':           '${BUCKET_NAME}',
+  'repo_url':              '${REPO_URL}',
+  'region':                '${SFN_REGION}',
 }))
 ")
 
@@ -60,7 +67,7 @@ echo "Starting Step Functions execution..."
 EXECUTION_ARN=$(aws stepfunctions start-execution \
   --state-machine-arn "${STATE_MACHINE_ARN}" \
   --input             "${INPUT_JSON}" \
-  --region            "${REGION}" \
+  --region            "${SFN_REGION}" \
   --query             'executionArn' \
   --output            text)
 
@@ -71,14 +78,17 @@ if [[ "${WAIT}" == "true" ]]; then
   while true; do
     STATUS=$(aws stepfunctions describe-execution \
       --execution-arn "${EXECUTION_ARN}" \
-      --region        "${REGION}" \
+      --region        "${SFN_REGION}" \
       --query         'status' \
       --output        text)
     echo "  Status: ${STATUS}"
     case "${STATUS}" in
       SUCCEEDED) echo "Execution SUCCEEDED."; break ;;
       FAILED|TIMED_OUT|ABORTED)
-        echo "Execution ${STATUS}. Check CloudWatch Logs or Step Functions console."
+        echo "Execution ${STATUS}."
+        echo "  Execution ARN: ${EXECUTION_ARN}"
+        echo "  Logs: aws logs tail /aws/codebuild/rag-hashicorp-pipeline --follow"
+        echo "  Console: https://console.aws.amazon.com/states/home?region=${SFN_REGION}#/executions/details/${EXECUTION_ARN}"
         exit 1
         ;;
       *) sleep "${POLL_INTERVAL}" ;;

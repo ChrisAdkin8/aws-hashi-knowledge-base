@@ -20,9 +20,6 @@ vars:
     sh: 'aws sts get-caller-identity --query Account --output text 2>/dev/null || echo ""'
   STATE_BUCKET:
     sh: 'echo "{{.ACCOUNT_ID}}-tf-state-$(echo -n "{{.ACCOUNT_ID}}" | sha256sum | cut -c1-8)"'
-  LOCK_TABLE: 'terraform-state-lock'
-  MIN_SCORE: '{{.MIN_SCORE | default "0.5"}}'
-
 tasks:
 
   default:
@@ -54,24 +51,24 @@ tasks:
   up:
     desc: "Full end-to-end deploy: preflight → bootstrap → apply → pipeline"
     summary: |
-      Provisions the complete Bedrock RAG pipeline in a single command.
+      Provisions the complete Kendra RAG pipeline in a single command.
       Idempotent — safe to re-run. Each step is skipped automatically if
       already complete.
 
       Steps:
         0. Preflight checks (tools, auth, Python packages, files, Terraform)
-        1. Create S3 state bucket + DynamoDB lock table (bootstrap_state.sh)
-        2. terraform apply — infra (first pass)
-        3. create_knowledge_base.py — creates KB + data source, writes kb.auto.tfvars
-        4. terraform apply — second pass, wires KB/DS IDs into scheduler target
-        5. Trigger first pipeline run and wait
+        1. Create S3 state bucket (bootstrap_state.sh)
+        2. terraform apply — provisions all infra including Kendra index + data source
+        3. Trigger first pipeline run and wait
+
+      Note: Kendra index creation takes 10-30 minutes.
 
       Required vars: REPO_URI
       Optional vars: REGION, SKIP_PIPELINE=true
 
       Example:
         task up REPO_URI=https://github.com/org/repo
-        task up REPO_URI=https://github.com/org/repo REGION=eu-west-2 SKIP_PIPELINE=true
+        task up REPO_URI=https://github.com/org/repo REGION=us-east-1 SKIP_PIPELINE=true
     requires:
       vars: [REPO_URI]
     cmds:
@@ -149,24 +146,25 @@ tasks:
 
   init:
     desc: "Initialise Terraform with remote S3 backend"
+    env:
+      AWS_DEFAULT_REGION: '{{.REGION}}'
     cmds:
       - |
         terraform -chdir={{.TF_DIR}} init \
           -backend-config="bucket={{.STATE_BUCKET}}" \
           -backend-config="region={{.REGION}}" \
-          -backend-config="dynamodb_table={{.LOCK_TABLE}}" \
+          -reconfigure \
           -input=false
-    status:
-      - test -d {{.TF_DIR}}/.terraform
 
   init:upgrade:
     desc: "Re-initialise and upgrade providers"
+    env:
+      AWS_DEFAULT_REGION: '{{.REGION}}'
     cmds:
       - |
         terraform -chdir={{.TF_DIR}} init \
           -backend-config="bucket={{.STATE_BUCKET}}" \
           -backend-config="region={{.REGION}}" \
-          -backend-config="dynamodb_table={{.LOCK_TABLE}}" \
           -input=false -upgrade
 
   validate:
@@ -200,42 +198,6 @@ tasks:
     cmds:
       - terraform -chdir={{.TF_DIR}} output
 
-  # ── Knowledge Base ─────────────────────────────────────────────────────────
-
-  kb:create:
-    desc: "Create the Bedrock Knowledge Base and write kb.auto.tfvars"
-    summary: |
-      Runs create_knowledge_base.py to create the Bedrock Knowledge Base and
-      S3 data source using the OpenSearch Serverless collection provisioned by
-      Terraform. Writes knowledge_base_id and data_source_id to kb.auto.tfvars
-      so that a second terraform apply can wire them into the scheduler.
-
-      Run 'task apply' after this to complete the wiring.
-
-      Example:
-        task kb:create
-    deps: [init]
-    vars:
-      KB_ROLE_ARN:
-        sh: 'terraform -chdir={{.TF_DIR}} output -raw bedrock_kb_role_arn 2>/dev/null'
-      COLLECTION_ARN:
-        sh: 'terraform -chdir={{.TF_DIR}} output -raw opensearch_collection_arn 2>/dev/null'
-      COLLECTION_ENDPOINT:
-        sh: 'terraform -chdir={{.TF_DIR}} output -raw opensearch_collection_endpoint 2>/dev/null'
-      RAG_BUCKET:
-        sh: 'terraform -chdir={{.TF_DIR}} output -raw rag_bucket_name 2>/dev/null'
-    cmds:
-      - |
-        {{.PYTHON}} scripts/create_knowledge_base.py \
-          --region              {{.REGION}} \
-          --kb-role-arn         {{.KB_ROLE_ARN}} \
-          --collection-arn      {{.COLLECTION_ARN}} \
-          --collection-endpoint {{.COLLECTION_ENDPOINT}} \
-          --bucket-name         {{.RAG_BUCKET}} \
-          --output-id-only > {{.TF_DIR}}/kb.auto.tfvars
-      - echo "Wrote {{.TF_DIR}}/kb.auto.tfvars:"
-      - cat {{.TF_DIR}}/kb.auto.tfvars
-
   # ── Pipeline operations ────────────────────────────────────────────────────
 
   pipeline:run:
@@ -244,55 +206,56 @@ tasks:
       Starts a Step Functions execution for the RAG pipeline and polls until
       it completes (SUCCEEDED, FAILED, TIMED_OUT, or ABORTED).
 
-      The state machine ARN, Knowledge Base ID, and Data Source ID are
+      The state machine ARN, Kendra Index ID, and Data Source ID are
       auto-detected from Terraform output when not explicitly provided.
 
       Example:
         task pipeline:run
-        task pipeline:run KB_ID=ABCDEFGHIJ DS_ID=KLMNOPQRST
+        task pipeline:run KENDRA_INDEX_ID=ABCDEFGHIJ KENDRA_DS_ID=KLMNOPQRST
     deps: [init]
     vars:
       STATE_MACHINE_ARN:
         sh: 'terraform -chdir={{.TF_DIR}} output -raw state_machine_arn 2>/dev/null'
       RAG_BUCKET:
         sh: 'terraform -chdir={{.TF_DIR}} output -raw rag_bucket_name 2>/dev/null'
-      KB_ID:
+      KENDRA_INDEX_ID:
         sh: >
-          {{if .KB_ID}}echo "{{.KB_ID}}"{{else}}
-          grep knowledge_base_id {{.TF_DIR}}/kb.auto.tfvars 2>/dev/null | cut -d'"' -f2 || echo ""
+          {{if .KENDRA_INDEX_ID}}echo "{{.KENDRA_INDEX_ID}}"{{else}}
+          terraform -chdir={{.TF_DIR}} output -raw kendra_index_id 2>/dev/null || echo ""
           {{end}}
-      DS_ID:
+      KENDRA_DS_ID:
         sh: >
-          {{if .DS_ID}}echo "{{.DS_ID}}"{{else}}
-          grep data_source_id {{.TF_DIR}}/kb.auto.tfvars 2>/dev/null | cut -d'"' -f2 || echo ""
+          {{if .KENDRA_DS_ID}}echo "{{.KENDRA_DS_ID}}"{{else}}
+          terraform -chdir={{.TF_DIR}} output -raw kendra_data_source_id 2>/dev/null || echo ""
           {{end}}
       REPO_URI:
         sh: 'grep repo_uri {{.TF_DIR}}/terraform.tfvars 2>/dev/null | cut -d\" -f2 || echo ""'
     cmds:
       - |
         scripts/run_pipeline.sh \
-          --state-machine-arn {{.STATE_MACHINE_ARN}} \
-          --region            {{.REGION}} \
-          --knowledge-base-id {{.KB_ID}} \
-          --data-source-id    {{.DS_ID}} \
-          --bucket-name       {{.RAG_BUCKET}} \
-          --repo-url          {{.REPO_URI}} \
+          --state-machine-arn      {{.STATE_MACHINE_ARN}} \
+          --region                 {{.REGION}} \
+          --kendra-index-id        {{.KENDRA_INDEX_ID}} \
+          --kendra-data-source-id  {{.KENDRA_DS_ID}} \
+          --bucket-name            {{.RAG_BUCKET}} \
+          --repo-url               {{.REPO_URI}} \
           --wait
 
   pipeline:test:
-    desc: "Run retrieval quality tests against the Knowledge Base"
+    desc: "Run retrieval quality tests against the Kendra index"
     summary: |
-      Runs 10 test queries against the Bedrock Knowledge Base covering all
-      product families and source types. Reports result counts and relevance
-      scores per topic.
+      Runs 10 test queries against the Kendra index covering all product
+      families and source types. Reports result counts and confidence levels.
 
       Example:
-        task pipeline:test KB_ID=ABCDEFGHIJ
-        task pipeline:test KB_ID=ABCDEFGHIJ MIN_SCORE=0.7
+        task pipeline:test KENDRA_INDEX_ID=ABCDEFGHIJ
+        task pipeline:test KENDRA_INDEX_ID=ABCDEFGHIJ MIN_CONFIDENCE=MEDIUM
     requires:
-      vars: [KB_ID]
+      vars: [KENDRA_INDEX_ID]
+    vars:
+      MIN_CONFIDENCE: '{{.MIN_CONFIDENCE | default "LOW"}}'
     cmds:
-      - "{{.PYTHON}} scripts/test_retrieval.py --region {{.REGION}} --knowledge-base-id {{.KB_ID}} --min-score {{.MIN_SCORE}}"
+      - "{{.PYTHON}} scripts/test_retrieval.py --region {{.REGION}} --kendra-index-id {{.KENDRA_INDEX_ID}} --min-confidence {{.MIN_CONFIDENCE}}"
 
   pipeline:token-efficiency:
     desc: "Compare token efficiency of RAG retrieval vs raw documentation"
@@ -300,18 +263,15 @@ tasks:
       Runs a suite of cross-product queries and compares token cost of RAG
       retrieval against the estimated cost of pasting full documentation pages.
 
-      Outputs per-query breakdown and overall token savings summary.
-      Typical result: ~96% token reduction vs raw docs.
-
       Optional: install tiktoken for precise token counting:
         pip install tiktoken
 
       Example:
-        task pipeline:token-efficiency KB_ID=ABCDEFGHIJ
+        task pipeline:token-efficiency KENDRA_INDEX_ID=ABCDEFGHIJ
     requires:
-      vars: [KB_ID]
+      vars: [KENDRA_INDEX_ID]
     cmds:
-      - "{{.PYTHON}} scripts/test_token_efficiency.py --region {{.REGION}} --knowledge-base-id {{.KB_ID}}"
+      - "{{.PYTHON}} scripts/test_token_efficiency.py --region {{.REGION}} --kendra-index-id {{.KENDRA_INDEX_ID}}"
 
   # ── Preflight checks ───────────────────────────────────────────────────────
 
@@ -452,7 +412,6 @@ tasks:
           codebuild/scripts/discover_modules.py
           codebuild/scripts/process_docs.py
           codebuild/scripts/requirements.txt
-          scripts/create_knowledge_base.py
           scripts/test_retrieval.py
           scripts/run_pipeline.sh
           scripts/setup_claude_bedrock.sh
@@ -547,41 +506,38 @@ tasks:
       Writes the hashicorp-rag mcpServers entry into .claude/settings.local.json
       so that Claude Code starts the MCP server automatically.
 
-      The Knowledge Base ID must be provided explicitly (it is not a Terraform
-      output because it is managed outside Terraform by create_knowledge_base.py).
-
       After running this task, restart Claude Code. The tools
-      search_hashicorp_docs and get_knowledge_base_info will be available.
+      search_hashicorp_docs and get_index_info will be available.
 
       Example:
-        task mcp:setup KB_ID=ABCDEFGHIJ
+        task mcp:setup KENDRA_INDEX_ID=ABCDEFGHIJ
     requires:
-      vars: [KB_ID]
+      vars: [KENDRA_INDEX_ID]
     cmds:
       - |
         scripts/setup_mcp.sh \
-          --region             {{.REGION}} \
-          --knowledge-base-id  {{.KB_ID}}
+          --region          {{.REGION}} \
+          --kendra-index-id {{.KENDRA_INDEX_ID}}
 
   mcp:test:
-    desc: "Smoke-test the MCP server tools against the live Knowledge Base"
+    desc: "Smoke-test the MCP server tools against the live Kendra index"
     summary: |
       Runs the MCP server tool functions directly to confirm that credentials,
       environment variables, and retrieval are all working correctly.
 
       Checks:
-        1. get_knowledge_base_info — verifies configuration
-        2. search_hashicorp_docs   — basic query
-        3. search_hashicorp_docs   — filtered query (product_family=vault)
-        4. search_hashicorp_docs   — no-results edge case
+        1. get_index_info         — verifies configuration
+        2. search_hashicorp_docs  — basic query
+        3. search_hashicorp_docs  — filtered query (product_family=vault)
+        4. search_hashicorp_docs  — no-results edge case
 
       Example:
-        task mcp:test KB_ID=ABCDEFGHIJ
+        task mcp:test KENDRA_INDEX_ID=ABCDEFGHIJ
     requires:
-      vars: [KB_ID]
+      vars: [KENDRA_INDEX_ID]
     env:
       AWS_REGION: "{{.REGION}}"
-      AWS_KNOWLEDGE_BASE_ID: "{{.KB_ID}}"
+      AWS_KENDRA_INDEX_ID: "{{.KENDRA_INDEX_ID}}"
     cmds:
       - "{{.PYTHON}} mcp/test_server.py"
 

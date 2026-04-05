@@ -1,30 +1,21 @@
 data "aws_caller_identity" "current" {}
 
 locals {
-  account_id          = data.aws_caller_identity.current.account_id
-  rag_bucket_name     = "hashicorp-rag-docs-${substr(sha256(local.account_id), 0, 8)}"
-  embedding_model_arn = var.embedding_model_arn != "" ? var.embedding_model_arn : "arn:aws:bedrock:${var.region}::foundation-model/amazon.titan-embed-text-v2:0"
-
-  # Convert STS assumed-role ARN → IAM role ARN so the deployer can create
-  # the vector index in OpenSearch Serverless via create_knowledge_base.py.
-  # arn:aws:sts::ACCT:assumed-role/ROLE/SESSION → arn:aws:iam::ACCT:role/ROLE
-  # IAM user/root ARNs are passed through unchanged (regex won't match).
-  _deployer_match   = try(regex("arn:aws:sts::([0-9]+):assumed-role/([^/]+)/", data.aws_caller_identity.current.arn), null)
-  deployer_role_arn = local._deployer_match != null ? "arn:aws:iam::${local._deployer_match[0]}:role/${local._deployer_match[1]}" : data.aws_caller_identity.current.arn
+  account_id            = data.aws_caller_identity.current.account_id
+  rag_bucket_name       = "hashicorp-rag-docs-${var.region}-${substr(sha256(local.account_id), 0, 8)}"
+  kendra_data_source_id = split("/", aws_kendra_data_source.s3.id)[0]
 }
 
 # ── S3 Bucket (RAG document staging) ──────────────────────────────────────────
 
 resource "aws_s3_bucket" "rag_docs" {
   bucket        = local.rag_bucket_name
-  force_destroy = false
+  force_destroy = true
 }
 
 resource "aws_s3_bucket_versioning" "rag_docs" {
   bucket = aws_s3_bucket.rag_docs.id
-  versioning_configuration {
-    status = "Enabled"
-  }
+  versioning_configuration { status = "Enabled" }
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "rag_docs" {
@@ -33,143 +24,144 @@ resource "aws_s3_bucket_lifecycle_configuration" "rag_docs" {
     id     = "expire-old-versions"
     status = "Enabled"
     filter {}
-    noncurrent_version_expiration {
-      noncurrent_days = 90
-    }
+    noncurrent_version_expiration { noncurrent_days = 90 }
   }
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "rag_docs" {
   bucket = aws_s3_bucket.rag_docs.id
   rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "aws:kms"
-    }
+    apply_server_side_encryption_by_default { sse_algorithm = "aws:kms" }
   }
 }
 
 resource "aws_s3_bucket_public_access_block" "rag_docs" {
   bucket                  = aws_s3_bucket.rag_docs.id
   block_public_acls       = true
-  block_public_policy     = true
   ignore_public_acls      = true
+  block_public_policy     = true
   restrict_public_buckets = true
 }
 
-# ── OpenSearch Serverless (vector store) ──────────────────────────────────────
+# ── Kendra Index ──────────────────────────────────────────────────────────────
 
-resource "aws_opensearchserverless_collection" "vectors" {
-  name = var.collection_name
-  type = "VECTORSEARCH"
+resource "aws_kendra_index" "main" {
+  name     = "hashicorp-rag-index"
+  edition  = var.kendra_edition
+  role_arn = aws_iam_role.kendra.arn
 
-  depends_on = [
-    aws_opensearchserverless_security_policy.encryption,
-    aws_opensearchserverless_security_policy.network,
-    aws_opensearchserverless_access_policy.data,
-  ]
+  document_metadata_configuration_updates {
+    name = "product"
+    type = "STRING_VALUE"
+    search {
+      displayable = true
+      facetable   = true
+      searchable  = true
+      sortable    = false
+    }
+  }
+
+  document_metadata_configuration_updates {
+    name = "product_family"
+    type = "STRING_VALUE"
+    search {
+      displayable = true
+      facetable   = true
+      searchable  = true
+      sortable    = false
+    }
+  }
+
+  document_metadata_configuration_updates {
+    name = "source_type"
+    type = "STRING_VALUE"
+    search {
+      displayable = true
+      facetable   = true
+      searchable  = true
+      sortable    = false
+    }
+  }
 }
 
-resource "aws_opensearchserverless_security_policy" "encryption" {
-  name = "${var.collection_name}-encryption"
-  type = "encryption"
-  policy = jsonencode({
-    Rules = [{
-      ResourceType = "collection"
-      Resource     = ["collection/${var.collection_name}"]
-    }]
-    AWSOwnedKey = true
-  })
+resource "aws_kendra_data_source" "s3" {
+  index_id = aws_kendra_index.main.id
+  name     = "hashicorp-docs-s3"
+  type     = "S3"
+  role_arn = aws_iam_role.kendra.arn
+
+  configuration {
+    s3_configuration {
+      bucket_name        = aws_s3_bucket.rag_docs.id
+      exclusion_patterns = ["*.metadata.json"]
+    }
+  }
 }
 
-resource "aws_opensearchserverless_security_policy" "network" {
-  name = "${var.collection_name}-network"
-  type = "network"
-  policy = jsonencode([{
-    Rules = [{
-      ResourceType = "collection"
-      Resource     = ["collection/${var.collection_name}"]
-      }, {
-      ResourceType = "dashboard"
-      Resource     = ["collection/${var.collection_name}"]
-    }]
-    AllowFromPublic = true
-  }])
-}
+# ── IAM: Kendra execution role ────────────────────────────────────────────────
 
-resource "aws_opensearchserverless_access_policy" "data" {
-  name = "${var.collection_name}-data"
-  type = "data"
-  policy = jsonencode([{
-    Rules = [
-      {
-        ResourceType = "index"
-        Resource     = ["index/${var.collection_name}/*"]
-        Permission = [
-          "aoss:CreateIndex",
-          "aoss:UpdateIndex",
-          "aoss:DescribeIndex",
-          "aoss:ReadDocument",
-          "aoss:WriteDocument"
-        ]
-      },
-      {
-        ResourceType = "collection"
-        Resource     = ["collection/${var.collection_name}"]
-        Permission = [
-          "aoss:CreateCollectionItems",
-          "aoss:UpdateCollectionItems",
-          "aoss:DescribeCollectionItems"
-        ]
-      }
-    ]
-    # Include the deployer so create_knowledge_base.py can create the vector index.
-    Principal = [aws_iam_role.bedrock_kb.arn, local.deployer_role_arn]
-  }])
-}
-
-# ── IAM: Bedrock Knowledge Base execution role ────────────────────────────────
-
-resource "aws_iam_role" "bedrock_kb" {
-  name = "bedrock-kb-hashicorp-rag"
+resource "aws_iam_role" "kendra" {
+  name = "hashicorp-rag-kendra"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Effect    = "Allow"
-      Principal = { Service = "bedrock.amazonaws.com" }
+      Principal = { Service = "kendra.amazonaws.com" }
       Action    = "sts:AssumeRole"
       Condition = {
-        StringEquals = {
-          "aws:SourceAccount" = local.account_id
-        }
+        StringEquals = { "aws:SourceAccount" = local.account_id }
       }
     }]
   })
 }
 
-resource "aws_iam_role_policy" "bedrock_kb" {
-  name = "bedrock-kb-policy"
-  role = aws_iam_role.bedrock_kb.id
+resource "aws_iam_role_policy" "kendra" {
+  name = "kendra-policy"
+  role = aws_iam_role.kendra.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "cloudwatch:PutMetricData"
+        Resource = "*"
+        Condition = {
+          StringEquals = { "cloudwatch:namespace" = "Kendra" }
+        }
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:DescribeLogGroups",
+        ]
+        Resource = ["arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/kendra/*"]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogStreams",
+        ]
+        Resource = ["arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/kendra/*:log-stream:*"]
+      },
       {
         Effect = "Allow"
         Action = ["s3:GetObject", "s3:ListBucket"]
         Resource = [
           aws_s3_bucket.rag_docs.arn,
-          "${aws_s3_bucket.rag_docs.arn}/*"
+          "${aws_s3_bucket.rag_docs.arn}/*",
         ]
       },
       {
-        Effect   = "Allow"
-        Action   = ["bedrock:InvokeModel"]
-        Resource = [local.embedding_model_arn]
+        Effect = "Allow"
+        Action = [
+          "kendra:BatchPutDocument",
+          "kendra:BatchDeleteDocument",
+        ]
+        Resource = ["arn:aws:kendra:${var.region}:${local.account_id}:index/*"]
       },
-      {
-        Effect   = "Allow"
-        Action   = ["aoss:APIAccessAll"]
-        Resource = [aws_opensearchserverless_collection.vectors.arn]
-      }
     ]
   })
 }
@@ -199,7 +191,7 @@ resource "aws_iam_role_policy" "codebuild" {
         Action = ["s3:PutObject", "s3:GetObject", "s3:ListBucket", "s3:DeleteObject"]
         Resource = [
           aws_s3_bucket.rag_docs.arn,
-          "${aws_s3_bucket.rag_docs.arn}/*"
+          "${aws_s3_bucket.rag_docs.arn}/*",
         ]
       },
       {
@@ -214,7 +206,7 @@ resource "aws_iam_role_policy" "codebuild" {
         Condition = {
           StringEquals = { "aws:ResourceTag/Project" = "hashicorp-rag-pipeline" }
         }
-      }
+      },
     ]
   })
 }
@@ -241,13 +233,20 @@ resource "aws_iam_role_policy" "step_functions" {
     Statement = [
       {
         Effect   = "Allow"
-        Action   = ["codebuild:StartBuild", "codebuild:BatchGetBuilds"]
+        Action   = ["codebuild:StartBuild", "codebuild:StopBuild", "codebuild:BatchGetBuilds"]
         Resource = [aws_codebuild_project.rag_pipeline.arn]
       },
       {
-        Effect   = "Allow"
-        Action   = ["bedrock:StartIngestionJob", "bedrock:GetIngestionJob", "bedrock:Retrieve"]
-        Resource = ["arn:aws:bedrock:${var.region}:${local.account_id}:knowledge-base/*"]
+        Effect = "Allow"
+        Action = [
+          "kendra:StartDataSourceSyncJob",
+          "kendra:ListDataSourceSyncJobs",
+          "kendra:Query",
+        ]
+        Resource = [
+          aws_kendra_index.main.arn,
+          "${aws_kendra_index.main.arn}/data-source/*",
+        ]
       },
       {
         Effect = "Allow"
@@ -258,12 +257,12 @@ resource "aws_iam_role_policy" "step_functions" {
           "events:DeleteRule",
           "events:RemoveTargets",
           "events:CreateManagedRule",
-          "events:DeleteManagedRule"
+          "events:DeleteManagedRule",
         ]
         # Wildcard required: SFN validates managed-rule creation before the rule ARN is known,
         # and the default event bus path format may differ across regions (rule/* vs rule/default/*).
         Resource = ["*"]
-      }
+      },
     ]
   })
 }
@@ -344,10 +343,10 @@ resource "aws_iam_role_policy" "github_actions" {
           "s3:ListBucket",
           "dynamodb:GetItem",
           "dynamodb:PutItem",
-          "dynamodb:DeleteItem"
+          "dynamodb:DeleteItem",
         ]
         Resource = "*"
-      }
+      },
     ]
   })
 }
@@ -398,10 +397,6 @@ resource "aws_sfn_state_machine" "rag_pipeline" {
 
   definition = templatefile("${path.module}/../step-functions/rag_pipeline.asl.json", {
     codebuild_project_name = aws_codebuild_project.rag_pipeline.name
-    knowledge_base_id      = var.knowledge_base_id
-    data_source_id         = var.data_source_id
-    rag_bucket             = aws_s3_bucket.rag_docs.id
-    region                 = var.region
   })
 }
 
@@ -423,13 +418,11 @@ resource "aws_scheduler_schedule" "rag_weekly_refresh" {
     role_arn = aws_iam_role.scheduler.arn
 
     input = jsonencode({
-      knowledge_base_id = var.knowledge_base_id
-      data_source_id    = var.data_source_id
-      bucket_name       = aws_s3_bucket.rag_docs.id
-      chunk_size        = var.chunk_size
-      chunk_overlap_pct = var.chunk_overlap_pct
-      region            = var.region
-      repo_url          = var.repo_uri
+      kendra_index_id       = aws_kendra_index.main.id
+      kendra_data_source_id = local.kendra_data_source_id
+      bucket_name           = aws_s3_bucket.rag_docs.id
+      region                = var.region
+      repo_url              = var.repo_uri
     })
   }
 }

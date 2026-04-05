@@ -1,24 +1,21 @@
 #!/usr/bin/env bash
-# deploy.sh — End-to-end deploy orchestrator for the HashiCorp Bedrock RAG pipeline.
+# deploy.sh — End-to-end deploy orchestrator for the HashiCorp Bedrock RAG pipeline (Kendra backend).
 #
 # Called by `task up`. Idempotent — safe to re-run.
 #
 # Steps:
-#   1. Bootstrap S3 state bucket + DynamoDB lock table
-#   2. terraform init + terraform apply (first pass — provisions infra)
-#   3. create_knowledge_base.py → writes kb.auto.tfvars
-#   4. terraform apply (second pass — wires KB/DS IDs into scheduler target)
-#   5. Trigger first pipeline run (unless --skip-pipeline)
+#   1. Bootstrap S3 state bucket
+#   2. terraform init + terraform apply (provisions all infra including Kendra index + data source)
+#   3. Trigger first pipeline run (unless --skip-pipeline)
 #
 # Usage:
 #   scripts/deploy.sh --region us-west-2 --repo-uri https://github.com/org/repo
 set -euo pipefail
 
-REGION="us-west-2"
+REGION="us-east-1"
 REPO_URI=""
 SKIP_PIPELINE=false
 TF_DIR="terraform"
-PYTHON=".venv/bin/python3"
 
 usage() {
   echo "Usage: $0 --region REGION --repo-uri REPO_URI [--skip-pipeline]"
@@ -42,17 +39,25 @@ fi
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 STATE_BUCKET="${ACCOUNT_ID}-tf-state-$(echo -n "${ACCOUNT_ID}" | sha256sum | cut -c1-8)"
-LOCK_TABLE="terraform-state-lock"
 
-echo "==> Step 1: Bootstrap state bucket and DynamoDB lock table"
+echo "==> Step 1: Bootstrap state bucket"
 bash scripts/bootstrap_state.sh --region "${REGION}"
 
 echo ""
-echo "==> Step 2: terraform init + apply (first pass)"
+echo "==> Step 2: terraform init + apply"
+export AWS_DEFAULT_REGION="${REGION}"
+
+# Detect actual bucket region (may differ from deployment region if bucket pre-exists)
+BUCKET_REGION=$(aws s3api get-bucket-location --bucket "${STATE_BUCKET}" --query LocationConstraint --output text 2>/dev/null || echo "${REGION}")
+if [[ "${BUCKET_REGION}" == "None" ]] || [[ -z "${BUCKET_REGION}" ]]; then
+  BUCKET_REGION="us-east-1"
+fi
+echo "State bucket region: ${BUCKET_REGION} (deploy region: ${REGION})"
+
 terraform -chdir="${TF_DIR}" init \
   -backend-config="bucket=${STATE_BUCKET}" \
-  -backend-config="region=${REGION}" \
-  -backend-config="dynamodb_table=${LOCK_TABLE}" \
+  -backend-config="region=${BUCKET_REGION}" \
+  -reconfigure \
   -input=false
 
 # Write tfvars if not already present
@@ -79,62 +84,38 @@ else
   echo "OIDC: import complete."
 fi
 
-terraform -chdir="${TF_DIR}" apply -auto-approve -input=false
-
+# NOTE: Kendra index creation takes 10-30 minutes — Terraform waits automatically.
 echo ""
-echo "==> Step 2b: Wait for OpenSearch Serverless access policy propagation"
-echo "AOSS data access policy changes take ~60s to propagate — waiting..."
-sleep 60
-echo "Wait complete."
-
-echo ""
-echo "==> Step 3: Create Bedrock Knowledge Base"
-KB_ROLE_ARN=$(terraform -chdir="${TF_DIR}" output -raw bedrock_kb_role_arn)
-COLLECTION_ARN=$(terraform -chdir="${TF_DIR}" output -raw opensearch_collection_arn)
-COLLECTION_ENDPOINT=$(terraform -chdir="${TF_DIR}" output -raw opensearch_collection_endpoint)
-RAG_BUCKET=$(terraform -chdir="${TF_DIR}" output -raw rag_bucket_name)
-
-"${PYTHON}" scripts/create_knowledge_base.py \
-  --region             "${REGION}" \
-  --kb-role-arn        "${KB_ROLE_ARN}" \
-  --collection-arn     "${COLLECTION_ARN}" \
-  --collection-endpoint "${COLLECTION_ENDPOINT}" \
-  --bucket-name        "${RAG_BUCKET}" \
-  --output-id-only > "${TF_DIR}/kb.auto.tfvars"
-
-echo "Wrote ${TF_DIR}/kb.auto.tfvars:"
-cat "${TF_DIR}/kb.auto.tfvars"
-
-echo ""
-echo "==> Step 4: terraform apply (second pass — wire in KB/DS IDs)"
+echo "Note: Kendra index provisioning takes 10-30 minutes — Terraform will wait."
 terraform -chdir="${TF_DIR}" apply -auto-approve -input=false
 
 echo ""
 if [[ "${SKIP_PIPELINE}" == "true" ]]; then
   echo "Skipping pipeline run (--skip-pipeline set)."
 else
-  echo "==> Step 5: Trigger first pipeline run"
-  STATE_MACHINE_ARN=$(terraform -chdir="${TF_DIR}" output -raw state_machine_arn 2>/dev/null || echo "")
-  KB_ID=$(grep knowledge_base_id "${TF_DIR}/kb.auto.tfvars" | cut -d'"' -f2)
-  DS_ID=$(grep data_source_id    "${TF_DIR}/kb.auto.tfvars" | cut -d'"' -f2)
+  echo "==> Step 3: Trigger first pipeline run"
+  STATE_MACHINE_ARN=$(terraform -chdir="${TF_DIR}" output -raw state_machine_arn)
+  KENDRA_INDEX_ID=$(terraform -chdir="${TF_DIR}" output -raw kendra_index_id)
+  KENDRA_DS_ID=$(terraform -chdir="${TF_DIR}" output -raw kendra_data_source_id)
+  RAG_BUCKET=$(terraform -chdir="${TF_DIR}" output -raw rag_bucket_name)
 
   bash scripts/run_pipeline.sh \
-    --state-machine-arn "${STATE_MACHINE_ARN}" \
-    --region            "${REGION}" \
-    --knowledge-base-id "${KB_ID}" \
-    --data-source-id    "${DS_ID}" \
-    --bucket-name       "${RAG_BUCKET}" \
-    --repo-url          "${REPO_URI}" \
+    --state-machine-arn   "${STATE_MACHINE_ARN}" \
+    --region              "${REGION}" \
+    --kendra-index-id     "${KENDRA_INDEX_ID}" \
+    --kendra-data-source-id "${KENDRA_DS_ID}" \
+    --bucket-name         "${RAG_BUCKET}" \
+    --repo-url            "${REPO_URI}" \
     --wait
 fi
 
 echo ""
 echo "Deploy complete."
-KB_ID=$(grep knowledge_base_id "${TF_DIR}/kb.auto.tfvars" | cut -d'"' -f2)
-echo "Knowledge Base ID: ${KB_ID}"
+KENDRA_INDEX_ID=$(terraform -chdir="${TF_DIR}" output -raw kendra_index_id)
+echo "Kendra Index ID: ${KENDRA_INDEX_ID}"
 echo ""
 echo "Validate retrieval:"
-echo "  task pipeline:test KB_ID=${KB_ID}"
+echo "  task pipeline:test KENDRA_INDEX_ID=${KENDRA_INDEX_ID}"
 echo ""
 echo "Set up MCP server for Claude Code:"
-echo "  task mcp:setup KB_ID=${KB_ID}"
+echo "  task mcp:setup KENDRA_INDEX_ID=${KENDRA_INDEX_ID}"

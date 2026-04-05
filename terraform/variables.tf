@@ -4,22 +4,10 @@ variable "region" {
   default     = "us-west-2"
 }
 
-variable "knowledge_base_name" {
-  description = "Bedrock Knowledge Base display name."
+variable "kendra_edition" {
+  description = "Kendra index edition. DEVELOPER_EDITION (~$810/mo) or ENTERPRISE_EDITION (~$1400/mo)."
   type        = string
-  default     = "hashicorp-knowledge-base"
-}
-
-variable "knowledge_base_id" {
-  description = "Bedrock Knowledge Base ID (populated by deploy.sh after create_knowledge_base.py runs)."
-  type        = string
-  default     = ""
-}
-
-variable "data_source_id" {
-  description = "Bedrock Data Source ID (populated by deploy.sh after create_knowledge_base.py runs)."
-  type        = string
-  default     = ""
+  default     = "DEVELOPER_EDITION"
 }
 
 variable "refresh_schedule" {
@@ -39,30 +27,6 @@ variable "repo_uri" {
   type        = string
 }
 
-variable "chunk_size" {
-  description = "Maximum tokens per Bedrock Knowledge Base chunk."
-  type        = number
-  default     = 1024
-}
-
-variable "chunk_overlap_pct" {
-  description = "Chunk overlap as a percentage (Bedrock uses percentage, not absolute tokens)."
-  type        = number
-  default     = 20
-}
-
-variable "embedding_model_arn" {
-  description = "ARN of the Bedrock foundation model used for embeddings. Override for a non-default region."
-  type        = string
-  default     = ""
-}
-
-variable "collection_name" {
-  description = "OpenSearch Serverless collection name for the vector store."
-  type        = string
-  default     = "hashicorp-rag-vectors"
-}
-
 variable "notification_email" {
   description = "Email address for CloudWatch alarm notifications. Leave empty to disable."
   type        = string
@@ -70,7 +34,8 @@ variable "notification_email" {
 }
 
 variable "create_github_oidc_provider" {
-  description = "Set to true to create the GitHub Actions OIDC provider and associated IAM role. Requires iam:CreateOpenIDConnectProvider. Set to false (default) to skip all GitHub Actions OIDC resources."
+  description = "Set to true to create the GitHub Actions OIDC provider and associated IAM role."
   type        = bool
   default     = false
 }
+

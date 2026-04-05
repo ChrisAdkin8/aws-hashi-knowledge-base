@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """test_token_efficiency.py — Compare RAG token cost vs raw documentation.
 
-Runs cross-product queries against the Bedrock Knowledge Base and estimates
-the token savings compared to pasting full documentation pages.
+Runs cross-product queries against the Kendra index and estimates the token
+savings compared to pasting full documentation pages.
 
 Usage:
     python3 scripts/test_token_efficiency.py \\
-        --region us-west-2 \\
-        --knowledge-base-id ABCDEFGHIJ \\
-        [--top-k 5] \\
-        [--min-score 0.0]
+        --region us-east-1 \\
+        --kendra-index-id ABCDEFGHIJ \\
+        [--top-k 5]
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-import sys
 
 import boto3
 
@@ -28,55 +26,57 @@ log = logging.getLogger(__name__)
 
 # Estimated raw documentation token counts (full pages, conservative)
 TEST_QUERIES: list[dict] = [
-    {"query": "How do I configure an S3 backend in Terraform?",             "raw_tokens": 9500},
-    {"query": "How do I set up the AWS provider in Terraform?",             "raw_tokens": 11000},
-    {"query": "How do I generate dynamic secrets with HashiCorp Vault?",    "raw_tokens": 14000},
-    {"query": "How do I configure Consul service mesh with mTLS?",          "raw_tokens": 16000},
-    {"query": "How do I build a Packer AMI with an HCL template?",         "raw_tokens": 8500},
-    {"query": "How do I use Vault dynamic secrets with the Terraform AWS provider?", "raw_tokens": 22000},
-    {"query": "How do I schedule a Docker workload in Nomad?",              "raw_tokens": 12000},
-    {"query": "How do I enforce Sentinel policies in Terraform Cloud?",     "raw_tokens": 13500},
-    {"query": "How do I compose reusable Terraform modules?",               "raw_tokens": 10000},
-    {"query": "How do I integrate Consul service discovery with Vault?",    "raw_tokens": 19500},
+    {"query": "How do I configure an S3 backend in Terraform?",                        "raw_tokens": 9500},
+    {"query": "How do I set up the AWS provider in Terraform?",                        "raw_tokens": 11000},
+    {"query": "How do I generate dynamic secrets with HashiCorp Vault?",               "raw_tokens": 14000},
+    {"query": "How do I configure Consul service mesh with mTLS?",                     "raw_tokens": 16000},
+    {"query": "How do I build a Packer AMI with an HCL template?",                    "raw_tokens": 8500},
+    {"query": "How do I use Vault dynamic secrets with the Terraform AWS provider?",   "raw_tokens": 22000},
+    {"query": "How do I schedule a Docker workload in Nomad?",                         "raw_tokens": 12000},
+    {"query": "How do I enforce Sentinel policies in Terraform Cloud?",                "raw_tokens": 13500},
+    {"query": "How do I compose reusable Terraform modules?",                          "raw_tokens": 10000},
+    {"query": "How do I integrate Consul service discovery with Vault?",               "raw_tokens": 19500},
 ]
 
 
 def _count_tokens(text: str) -> int:
-    """Count tokens using tiktoken if available, else approximate with word count × 1.3."""
     try:
         import tiktoken
         enc = tiktoken.get_encoding("cl100k_base")
         return len(enc.encode(text))
     except ImportError:
-        # Rough approximation: ~0.75 words per token
         return int(len(text.split()) * 1.3)
 
 
-def retrieve(client: object, kb_id: str, query: str, top_k: int, min_score: float) -> str:
-    """Retrieve context from the knowledge base and return concatenated chunks."""
-    resp = client.retrieve(
-        knowledgeBaseId=kb_id,
-        retrievalQuery={"text": query},
-        retrievalConfiguration={
-            "vectorSearchConfiguration": {
-                "numberOfResults": top_k,
-                "overrideSearchType": "HYBRID",
-            }
-        },
+def retrieve(client: object, index_id: str, query: str, top_k: int) -> str:
+    """Query Kendra and return concatenated excerpt text."""
+    resp = client.query(
+        IndexId=index_id,
+        QueryText=query,
+        PageSize=top_k,
+        # Removing QueryResultTypeFilter allows Kendra to return the best 
+        # matches regardless of whether it classifies them as DOCUMENT or ANSWER.
     )
-    results = resp.get("retrievalResults", [])
-    qualified = [r for r in results if r.get("score", 0.0) >= min_score]
-    chunks = [r["content"]["text"] for r in qualified if r.get("content", {}).get("text")]
+    
+    chunks = []
+    for item in resp.get("ResultItems", []):
+        # Kendra uses 'DocumentExcerpt' for general snippets 
+        # and 'AdditionalAttributes' for specific types.
+        excerpt = item.get("DocumentExcerpt", {}).get("Text", "")
+        if excerpt:
+            chunks.append(excerpt)
+            
+    if not chunks:
+        log.warning(f"No results found for query: {query}")
+        
     return "\n\n---\n\n".join(chunks)
 
 
 def main() -> None:
-    """Run token efficiency benchmark across all test queries."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--region", required=True)
-    parser.add_argument("--knowledge-base-id", required=True)
+    parser.add_argument("--kendra-index-id", required=True)
     parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--min-score", type=float, default=0.0)
     args = parser.parse_args()
 
     try:
@@ -87,8 +87,7 @@ def main() -> None:
 
     log.info("Token counting: %s", token_method)
 
-    client = boto3.client("bedrock-agent-runtime", region_name=args.region)
-
+    client = boto3.client("kendra", region_name=args.region)
     total_rag = 0
     total_raw = 0
 
@@ -99,7 +98,7 @@ def main() -> None:
         query = test["query"]
         raw_tokens = test["raw_tokens"]
         try:
-            context = retrieve(client, args.knowledge_base_id, query, args.top_k, args.min_score)
+            context = retrieve(client, args.kendra_index_id, query, args.top_k)
             rag_tokens = _count_tokens(context)
         except Exception as exc:
             log.error("Retrieval failed for '%s': %s", query[:40], exc)
