@@ -56,17 +56,17 @@ def _infer_metadata(path: Path, bucket: str) -> dict:
     s3_key = "/".join(rel.parts)
     title = path.stem.replace("_", " ").title()
 
-    # Schema Fix: Attributes must not be empty. Reserved fields like _source_uri 
-    # work best at the top level in the latest S3 connector versions.
+    # Schema Fix: Reserved system attributes like _source_uri MUST be 
+    # nested inside the Attributes object, alongside custom attributes.
     return {
+        "Title": title,
+        "ContentType": "PLAIN_TEXT",
         "Attributes": {
+            "_source_uri": f"s3://{bucket}/{s3_key}",
             "product": product or "unknown",
             "product_family": product_family or "unknown",
             "source_type": source_type or "unknown"
-        },
-        "Title": title,
-        "_source_uri": f"s3://{bucket}/{s3_key}",
-        "ContentType": "PLAIN_TEXT"
+        }
     }
 
 def write_sidecar(path: Path, metadata: dict) -> None:
