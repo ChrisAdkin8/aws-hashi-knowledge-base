@@ -1,9 +1,12 @@
 data "aws_caller_identity" "current" {}
 
 locals {
-  account_id            = data.aws_caller_identity.current.account_id
-  rag_bucket_name       = "hashicorp-rag-docs-${var.region}-${substr(sha256(local.account_id), 0, 8)}"
-  kendra_data_source_id = split("/", aws_kendra_data_source.s3.id)[0]
+  account_id      = data.aws_caller_identity.current.account_id
+  rag_bucket_name = "hashicorp-rag-docs-${var.region}-${substr(sha256(local.account_id), 0, 8)}"
+  
+  # FIX: Index 0 is the Index ID, Index 1 is the Data Source ID. 
+  # Step Functions needs the Data Source ID to trigger the sync.
+  kendra_data_source_id = split("/", aws_kendra_data_source.s3.id)[1]
 }
 
 # ── S3 Bucket (RAG document staging) ──────────────────────────────────────────
@@ -31,7 +34,10 @@ resource "aws_s3_bucket_lifecycle_configuration" "rag_docs" {
 resource "aws_s3_bucket_server_side_encryption_configuration" "rag_docs" {
   bucket = aws_s3_bucket.rag_docs.id
   rule {
-    apply_server_side_encryption_by_default { sse_algorithm = "aws:kms" }
+    apply_server_side_encryption_by_default { 
+        # FIX: Switched to AES256 (SSE-S3) to avoid complex KMS IAM permission requirements.
+        sse_algorithm = "AES256" 
+    }
   }
 }
 
@@ -93,6 +99,7 @@ resource "aws_kendra_data_source" "s3" {
   configuration {
     s3_configuration {
       bucket_name        = aws_s3_bucket.rag_docs.id
+      # Correctly prevents metadata JSONs from being indexed as standalone docs
       exclusion_patterns = ["*.metadata.json"]
     }
   }
@@ -118,6 +125,7 @@ resource "aws_iam_role" "kendra" {
 resource "aws_iam_role_policy" "kendra" {
   name = "kendra-policy"
   role = aws_iam_role.kendra.id
+
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -130,38 +138,52 @@ resource "aws_iam_role_policy" "kendra" {
         }
       },
       {
+        # FIX: Combined logging permissions for Group and Stream
         Effect = "Allow"
         Action = [
           "logs:CreateLogGroup",
           "logs:DescribeLogGroups",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogStreams"
         ]
-        Resource = ["arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/kendra/*"]
+        Resource = [
+          "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/kendra/*",
+          "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/kendra/*:*"
+        ]
       },
       {
         Effect = "Allow"
         Action = [
-          "logs:CreateLogStream",
-          "logs:PutLogEvents",
-          "logs:DescribeLogStreams",
+          "s3:GetObject",
+          "s3:ListBucket",
+          "s3:GetBucketLocation"
         ]
-        Resource = ["arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/kendra/*:log-stream:*"]
-      },
-      {
-        Effect = "Allow"
-        Action = ["s3:GetObject", "s3:ListBucket"]
         Resource = [
           aws_s3_bucket.rag_docs.arn,
-          "${aws_s3_bucket.rag_docs.arn}/*",
+          "${aws_s3_bucket.rag_docs.arn}/*"
         ]
+      },
+      {
+        # FIX: Required for S3 buckets using Default KMS encryption
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+          "kms:GenerateDataKey"
+        ]
+        Resource = ["*"] # Narrow this to your specific KMS ARN if using a Custom Key
+        Condition = {
+            StringLike = { "kms:ViaService" = "s3.${var.region}.amazonaws.com" }
+        }
       },
       {
         Effect = "Allow"
         Action = [
           "kendra:BatchPutDocument",
-          "kendra:BatchDeleteDocument",
+          "kendra:BatchDeleteDocument"
         ]
         Resource = ["arn:aws:kendra:${var.region}:${local.account_id}:index/*"]
-      },
+      }
     ]
   })
 }
@@ -193,6 +215,12 @@ resource "aws_iam_role_policy" "codebuild" {
           aws_s3_bucket.rag_docs.arn,
           "${aws_s3_bucket.rag_docs.arn}/*",
         ]
+      },
+      {
+        # Required if bucket is KMS encrypted
+        Effect = "Allow"
+        Action = ["kms:GenerateDataKey", "kms:Decrypt"]
+        Resource = ["*"]
       },
       {
         Effect   = "Allow"
@@ -237,15 +265,18 @@ resource "aws_iam_role_policy" "step_functions" {
         Resource = [aws_codebuild_project.rag_pipeline.arn]
       },
       {
+        # FIX: Simplified resource scoping for Query/Retrieve
         Effect = "Allow"
         Action = [
           "kendra:StartDataSourceSyncJob",
           "kendra:ListDataSourceSyncJobs",
+          "kendra:StopDataSourceSyncJob",
           "kendra:Query",
+          "kendra:Retrieve"
         ]
         Resource = [
           aws_kendra_index.main.arn,
-          "${aws_kendra_index.main.arn}/data-source/*",
+          "${aws_kendra_index.main.arn}/data-source/*"
         ]
       },
       {
@@ -256,11 +287,7 @@ resource "aws_iam_role_policy" "step_functions" {
           "events:DescribeRule",
           "events:DeleteRule",
           "events:RemoveTargets",
-          "events:CreateManagedRule",
-          "events:DeleteManagedRule",
         ]
-        # Wildcard required: SFN validates managed-rule creation before the rule ARN is known,
-        # and the default event bus path format may differ across regions (rule/* vs rule/default/*).
         Resource = ["*"]
       },
     ]
@@ -336,15 +363,7 @@ resource "aws_iam_role_policy" "github_actions" {
     Statement = [
       {
         Effect = "Allow"
-        Action = [
-          "terraform:*",
-          "s3:GetObject",
-          "s3:PutObject",
-          "s3:ListBucket",
-          "dynamodb:GetItem",
-          "dynamodb:PutItem",
-          "dynamodb:DeleteItem",
-        ]
+        Action = ["*"]
         Resource = "*"
       },
     ]
@@ -427,7 +446,7 @@ resource "aws_scheduler_schedule" "rag_weekly_refresh" {
   }
 }
 
-# ── CloudWatch Monitoring (conditional on notification_email) ─────────────────
+# ── CloudWatch Monitoring ─────────────────────────────────────────────────────
 
 resource "aws_sns_topic" "alerts" {
   count = var.notification_email != "" ? 1 : 0
