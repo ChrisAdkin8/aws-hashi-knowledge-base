@@ -54,15 +54,19 @@ def _infer_metadata(path: Path, bucket: str) -> dict:
 
     # Use forward slashes for S3 URI regardless of OS
     s3_key = "/".join(rel.parts)
+    
+    # FIX: Define the s3_uri variable before the return statement
+    s3_uri = f"s3://{bucket}/{s3_key}"
     title = path.stem.replace("_", " ").title()
 
     # Schema Fix: Reserved system attributes like _source_uri MUST be 
     # nested inside the Attributes object, alongside custom attributes.
     return {
+        "DocumentId": s3_uri,
         "Title": title,
         "ContentType": "PLAIN_TEXT",
         "Attributes": {
-            "_source_uri": f"s3://{bucket}/{s3_key}",
+            "_source_uri": s3_uri,
             "product": product or "unknown",
             "product_family": product_family or "unknown",
             "source_type": source_type or "unknown"

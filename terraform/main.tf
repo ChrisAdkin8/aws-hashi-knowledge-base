@@ -3,7 +3,7 @@ data "aws_caller_identity" "current" {}
 locals {
   account_id      = data.aws_caller_identity.current.account_id
   rag_bucket_name = "hashicorp-rag-docs-${var.region}-${substr(sha256(local.account_id), 0, 8)}"
-  
+
   # FIX: Index 0 is the Index ID, Index 1 is the Data Source ID. 
   # Step Functions needs the Data Source ID to trigger the sync.
   kendra_data_source_id = split("/", aws_kendra_data_source.s3.id)[1]
@@ -34,9 +34,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "rag_docs" {
 resource "aws_s3_bucket_server_side_encryption_configuration" "rag_docs" {
   bucket = aws_s3_bucket.rag_docs.id
   rule {
-    apply_server_side_encryption_by_default { 
-        # FIX: Switched to AES256 (SSE-S3) to avoid complex KMS IAM permission requirements.
-        sse_algorithm = "AES256" 
+    apply_server_side_encryption_by_default {
+      # FIX: Switched to AES256 (SSE-S3) to avoid complex KMS IAM permission requirements.
+      sse_algorithm = "AES256"
     }
   }
 }
@@ -98,7 +98,7 @@ resource "aws_kendra_data_source" "s3" {
 
   configuration {
     s3_configuration {
-      bucket_name        = aws_s3_bucket.rag_docs.id
+      bucket_name = aws_s3_bucket.rag_docs.id
       # Correctly prevents metadata JSONs from being indexed as standalone docs
       exclusion_patterns = ["*.metadata.json"]
     }
@@ -173,7 +173,7 @@ resource "aws_iam_role_policy" "kendra" {
         ]
         Resource = ["*"] # Narrow this to your specific KMS ARN if using a Custom Key
         Condition = {
-            StringLike = { "kms:ViaService" = "s3.${var.region}.amazonaws.com" }
+          StringLike = { "kms:ViaService" = "s3.${var.region}.amazonaws.com" }
         }
       },
       {
@@ -218,8 +218,8 @@ resource "aws_iam_role_policy" "codebuild" {
       },
       {
         # Required if bucket is KMS encrypted
-        Effect = "Allow"
-        Action = ["kms:GenerateDataKey", "kms:Decrypt"]
+        Effect   = "Allow"
+        Action   = ["kms:GenerateDataKey", "kms:Decrypt"]
         Resource = ["*"]
       },
       {
@@ -362,8 +362,8 @@ resource "aws_iam_role_policy" "github_actions" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow"
-        Action = ["*"]
+        Effect   = "Allow"
+        Action   = ["*"]
         Resource = "*"
       },
     ]
