@@ -6,7 +6,7 @@ Tools:
   - get_index_info        — inspect active region/index configuration
 
 Environment variables:
-  AWS_REGION          — AWS region (default: us-east-1)
+  AWS_REGION          — AWS region (defaults to boto3 session region, then us-east-1)
   AWS_KENDRA_INDEX_ID — Kendra index ID (required)
   Standard AWS credential chain (env vars, ~/.aws/credentials, instance profile, SSO)
 """
@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 
 mcp = FastMCP("hashicorp-rag")
 
-AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+AWS_REGION = os.environ.get("AWS_REGION") or boto3.session.Session().region_name or "us-east-1"
 KENDRA_INDEX_ID = os.environ.get("AWS_KENDRA_INDEX_ID", "")
 
 # Kendra confidence levels mapped to numeric equivalents for min_score filtering

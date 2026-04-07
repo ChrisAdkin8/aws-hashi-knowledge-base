@@ -73,6 +73,15 @@ task pipeline:test KENDRA_INDEX_ID=$(terraform -chdir=terraform output -raw kend
    - **Invalid metadata sidecar** — a `.metadata.json` file is malformed. Check `generate_metadata.py` output.
    - **Index capacity exceeded** — the index has hit the edition document limit (10,000 for Developer, 100,000/SCU for Enterprise). Check the Kendra console → index metrics.
 
+### Token efficiency task fails (index not found / wrong region)
+
+`scripts/test_token_efficiency.py` validates the index before running queries and exits with an actionable message.
+
+- **"Region X does not support Kendra"** — Kendra is not available in all regions. Supported regions: `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1`, `eu-west-2`, `ap-southeast-1`, `ap-southeast-2`, `ap-northeast-1`, `ap-northeast-2`, `ca-central-1`. Pass the correct `--region` flag.
+- **"Index not found in region X … Found it in Y"** — the script scans supported regions automatically and suggests the correct one.
+- **"Index is not ACTIVE"** — the index is still initialising or in an error state. Check the Kendra console and wait until status is `ACTIVE`.
+- **No results / empty output** — the index exists but has no documents. Run `task pipeline:run` to ingest and sync.
+
 ### Zero retrieval results
 
 1. Run `task pipeline:test KENDRA_INDEX_ID=<INDEX_ID>` — check which topics return 0 results.

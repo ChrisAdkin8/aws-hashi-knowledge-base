@@ -153,6 +153,19 @@ Kendra custom metadata attributes (`product`, `product_family`, `source_type`) a
    task pipeline:test KENDRA_INDEX_ID=<INDEX_ID>
    ```
 
+6. **Measure token efficiency** (optional)
+
+   Compares RAG retrieval token cost against pasting full documentation pages.
+   `KENDRA_INDEX_ID` and `REGION` are auto-detected from Terraform output when not provided.
+
+   ```bash
+   task pipeline:token-efficiency
+   # or explicitly:
+   task pipeline:token-efficiency KENDRA_INDEX_ID=<INDEX_ID> REGION=us-east-1
+   ```
+
+   Install `tiktoken` for exact token counts: `pip install tiktoken`
+
 ---
 
 ## Configuration

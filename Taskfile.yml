@@ -263,15 +263,35 @@ tasks:
       Runs a suite of cross-product queries and compares token cost of RAG
       retrieval against the estimated cost of pasting full documentation pages.
 
+      KENDRA_INDEX_ID and REGION are auto-detected from Terraform output when
+      not provided. REGION defaults to the Taskfile global only as a last resort.
+
       Optional: install tiktoken for precise token counting:
         pip install tiktoken
 
       Example:
+        task pipeline:token-efficiency
         task pipeline:token-efficiency KENDRA_INDEX_ID=ABCDEFGHIJ
-    requires:
-      vars: [KENDRA_INDEX_ID]
+        task pipeline:token-efficiency KENDRA_INDEX_ID=ABCDEFGHIJ REGION=us-west-1
+    deps: [init]
+    vars:
+      KENDRA_INDEX_ID:
+        sh: >
+          {{if .KENDRA_INDEX_ID}}echo "{{.KENDRA_INDEX_ID}}"{{else}}
+          terraform -chdir={{.TF_DIR}} output -raw kendra_index_id 2>/dev/null || echo ""
+          {{end}}
+      EFFECTIVE_REGION:
+        sh: >
+          terraform -chdir={{.TF_DIR}} output -raw aws_region 2>/dev/null ||
+          echo "{{.REGION}}"
     cmds:
-      - "{{.PYTHON}} scripts/test_token_efficiency.py --region {{.REGION}} --kendra-index-id {{.KENDRA_INDEX_ID}}"
+      - |
+        if [ -z "{{.KENDRA_INDEX_ID}}" ]; then
+          echo "Error: KENDRA_INDEX_ID could not be detected from Terraform output."
+          echo "Pass it explicitly: task pipeline:token-efficiency KENDRA_INDEX_ID=<id>"
+          exit 1
+        fi
+        {{.PYTHON}} scripts/test_token_efficiency.py --region {{.EFFECTIVE_REGION}} --kendra-index-id {{.KENDRA_INDEX_ID}}
 
   # ── Preflight checks ───────────────────────────────────────────────────────
 

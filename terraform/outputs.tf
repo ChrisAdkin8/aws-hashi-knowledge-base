@@ -42,3 +42,8 @@ output "codebuild_role_arn" {
   description = "ARN of the CodeBuild execution IAM role."
   value       = aws_iam_role.codebuild.arn
 }
+
+output "aws_region" {
+  description = "AWS region where resources are deployed."
+  value       = var.region
+}
