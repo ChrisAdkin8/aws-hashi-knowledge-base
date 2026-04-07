@@ -5,10 +5,10 @@
 # Claude Code starts the MCP server automatically when opened in this directory.
 #
 # Usage:
-#   scripts/setup_mcp.sh --knowledge-base-id ABCDEFGHIJ [--region us-west-2]
+#   scripts/setup_mcp.sh --knowledge-base-id ABCDEFGHIJ [--region us-east-1]
 set -euo pipefail
 
-REGION="us-west-2"
+REGION="us-east-1"
 KB_ID=""
 SETTINGS_FILE=".claude/settings.local.json"
 PYTHON=".venv/bin/python3"

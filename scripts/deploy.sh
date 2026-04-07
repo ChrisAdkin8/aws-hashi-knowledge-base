@@ -9,7 +9,7 @@
 #   3. Trigger first pipeline run (unless --skip-pipeline)
 #
 # Usage:
-#   scripts/deploy.sh --region us-west-2 --repo-uri https://github.com/org/repo
+#   scripts/deploy.sh --region us-east-1 --repo-uri https://github.com/org/repo
 set -euo pipefail
 
 REGION="us-east-1"

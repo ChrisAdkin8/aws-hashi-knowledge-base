@@ -3,14 +3,14 @@
 # State locking uses native S3 lock files (use_lockfile = true); no DynamoDB table needed.
 #
 # Usage:
-#   scripts/bootstrap_state.sh --region us-west-2
-#   scripts/bootstrap_state.sh --region us-east-1  # Note: us-east-1 omits LocationConstraint
+#   scripts/bootstrap_state.sh --region us-east-1
+#   scripts/bootstrap_state.sh --region us-west-2  # Note: us-east-1 omits LocationConstraint
 #
 # The bucket name is deterministic:
 #   Bucket: <ACCOUNT_ID>-tf-state-<8-char hash>
 set -euo pipefail
 
-REGION="us-west-2"
+REGION="us-east-1"
 
 usage() {
   echo "Usage: $0 [--region REGION]"

@@ -1,7 +1,7 @@
 variable "region" {
   description = "AWS region for all resources."
   type        = string
-  default     = "us-west-2"
+  default     = "us-east-1"
 }
 
 variable "kendra_edition" {

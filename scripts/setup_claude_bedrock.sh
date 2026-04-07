@@ -8,7 +8,7 @@
 #   source scripts/setup_claude_bedrock.sh [--region REGION] [--model MODEL] [--persist]
 set -euo pipefail
 
-REGION="us-west-2"
+REGION="us-east-1"
 MODEL="claude-sonnet-4-20250514"
 PERSIST=false
 MARKER="# claude-code-bedrock-config"
@@ -17,7 +17,7 @@ usage() {
   echo "Usage: source $0 [--region REGION] [--model MODEL] [--persist]"
   echo ""
   echo "Options:"
-  echo "  --region REGION   Bedrock region (default: us-west-2)"
+  echo "  --region REGION   Bedrock region (default: us-east-1)"
   echo "  --model  MODEL    Model ID (default: claude-sonnet-4-20250514)"
   echo "  --persist         Append exports to ~/.bashrc (idempotent)"
 }
