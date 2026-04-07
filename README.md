@@ -35,6 +35,8 @@ The CodeBuild job runs two parallel tracks:
 
 Both tracks converge at a single `aws s3 sync` upload, after which Step Functions triggers a Kendra data source sync job to index all new and changed documents.
 
+> **CDKTF excluded** — CDKTF (CDK for Terraform) documentation is intentionally excluded from the index. Path-based exclusion in `process_docs.py` drops any file under a `cdktf/` or `terraform-cdk/` directory, and title/keyword filters in the blog, discuss, and issues fetch scripts skip CDKTF-primary content.
+
 ---
 
 ## Data Sources

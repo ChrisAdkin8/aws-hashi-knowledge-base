@@ -8,6 +8,7 @@ Threads with accepted answers are reordered to front-load the resolution.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,6 +27,12 @@ OUTPUT_DIR = Path("/codebuild/output/cleaned/discuss")
 LOOKBACK_DAYS = 365
 MAX_REPLIES = 5
 MIN_REPLIES = 1
+
+# Threads whose title matches this pattern are CDKTF-related and skipped.
+_CDKTF_RE = re.compile(
+    r"\bcdktf\b|\bterraform[\s\-]cdk\b|\bcdk[\s\-]for[\s\-]terraform\b",
+    re.IGNORECASE,
+)
 
 CATEGORIES = [
     "terraform-core",
@@ -183,6 +190,9 @@ def process_category(category: str) -> int:
     written = 0
 
     for topic in topics:
+        if _CDKTF_RE.search(topic.get("title", "")):
+            log.debug("Skipping CDKTF discuss thread: %s", topic.get("title"))
+            continue
         topic_id = topic.get("id")
         posts = fetch_topic_posts(topic_id)
         has_accepted = any(p.get("accepted_answer") or p.get("post_type") == 3 for p in posts[1:])

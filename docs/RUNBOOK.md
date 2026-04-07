@@ -152,6 +152,14 @@ task apply   # apply
 
 Commit and push. The next pipeline run will pick up the latest scripts — CodeBuild clones this repository fresh on every build using the `REPO_URL` environment variable.
 
+### Adjusting content exclusions
+
+CDKTF content is excluded at the script level. To modify the exclusion rules:
+
+- **Docs paths** — edit `CDKTF_EXCLUDE_RE` in `process_docs.py`
+- **Blog posts** — edit `_CDKTF_RE` and the body mention threshold (currently 3) in `fetch_blogs.py`
+- **Discuss threads / GitHub issues** — edit `_CDKTF_RE` in `fetch_discuss.py` / `fetch_github_issues.py`
+
 ### Adding new product documentation
 
 For products whose docs live in `hashicorp/web-unified-docs` (Vault, Consul, Nomad, Terraform Enterprise, HCP Terraform):

@@ -99,6 +99,17 @@ Each service has a dedicated least-privilege execution role:
 
 ## Document Processing
 
+### Content exclusions
+
+CDKTF (CDK for Terraform) documentation is intentionally excluded from the index:
+
+| Script | Mechanism |
+|---|---|
+| `process_docs.py` | `CDKTF_EXCLUDE_RE` regex drops any file whose repo-relative path contains `cdktf/`, `terraform-cdk/`, or `cdk-for-terraform/` |
+| `fetch_blogs.py` | Posts with a CDKTF keyword in the title, or ≥3 CDKTF mentions in the body, are skipped |
+| `fetch_discuss.py` | Threads with a CDKTF keyword in the title are skipped |
+| `fetch_github_issues.py` | Issues with a CDKTF keyword in the title are skipped |
+
 ### Semantic pre-splitting (`process_docs.py`)
 
 Markdown files are split at `##`/`###` heading boundaries before upload. Each section becomes a separate file with its own Kendra metadata sidecar:

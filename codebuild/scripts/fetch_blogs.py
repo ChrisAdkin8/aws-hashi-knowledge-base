@@ -26,6 +26,14 @@ log = logging.getLogger(__name__)
 OUTPUT_DIR = Path("/codebuild/output/cleaned/blogs")
 LOOKBACK_DAYS = 365
 
+# Blog posts whose title contains a CDKTF keyword are skipped outright.
+# Posts where the body mentions CDKTF 3+ times are also skipped — the
+# threshold avoids dropping posts that mention CDKTF only in passing.
+_CDKTF_RE = re.compile(
+    r"\bcdktf\b|\bterraform[\s\-]cdk\b|\bcdk[\s\-]for[\s\-]terraform\b",
+    re.IGNORECASE,
+)
+
 PRODUCT_KEYWORDS: dict[str, list[str]] = {
     "terraform": ["terraform", "hcl", "provider", "module", "state", "workspace"],
     "vault": ["vault", "secret", "dynamic credentials", "pki", "kv", "auth method"],
@@ -189,6 +197,12 @@ def process_feed(feed_info: dict) -> int:
         if not body:
             body = entry.get("summary", "")
         if not body:
+            continue
+
+        # Skip posts that are primarily about CDKTF
+        title = entry["title"]
+        if _CDKTF_RE.search(title) or len(_CDKTF_RE.findall(body)) >= 3:
+            log.debug("Skipping CDKTF blog post: %s", title)
             continue
 
         product_family = _detect_product_family(entry["title"], body)

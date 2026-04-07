@@ -25,6 +25,14 @@ OUTPUT_DIR = Path("/codebuild/output/cleaned")
 MIN_SECTION_SIZE = 200
 MAX_SECTION_CHARS = 4000
 
+# Files whose repo-relative path matches this pattern are CDKTF-related and
+# excluded from the index. Matches cdktf/, terraform-cdk/, and
+# cdk-for-terraform/ directory components anywhere in the path.
+CDKTF_EXCLUDE_RE = re.compile(
+    r"(?:^|[/\\])(?:cdktf|terraform[\-_]cdk|cdk[\-_]for[\-_]terraform)(?:[/\\]|$)",
+    re.IGNORECASE,
+)
+
 REPO_CONFIG: dict[str, dict] = {
     # Search the whole website/ tree so rglob covers website/docs/, website/content/,
     # and any other nested layout used by different product repos.
@@ -260,6 +268,16 @@ def process_repo(repo_name: str, config: dict) -> int:
             md_files.extend(docs_path.rglob("*.md"))
             md_files.extend(docs_path.rglob("*.mdx"))
             md_files.extend(docs_path.rglob("*.markdown"))
+
+    # Strip any CDKTF-related files before processing
+    before = len(md_files)
+    md_files = [
+        f for f in md_files
+        if not CDKTF_EXCLUDE_RE.search(str(f.relative_to(repo_dir)))
+    ]
+    excluded = before - len(md_files)
+    if excluded:
+        log.info("Excluded %d CDKTF file(s) from %s", excluded, repo_name)
 
     if not md_files:
         log.info("No markdown files found in %s — skipping", repo_name)

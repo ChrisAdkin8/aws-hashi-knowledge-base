@@ -34,6 +34,12 @@ MAX_ISSUES_PER_REPO = 100
 
 LABEL_DENYLIST = {"stale", "wontfix", "duplicate", "invalid", "spam"}
 
+# Issues whose title matches this pattern are CDKTF-related and excluded.
+_CDKTF_RE = re.compile(
+    r"\bcdktf\b|\bterraform[\s\-]cdk\b|\bcdk[\s\-]for[\s\-]terraform\b",
+    re.IGNORECASE,
+)
+
 PRIORITY_REPOS = [
     ("hashicorp", "terraform"),
     ("hashicorp", "vault"),
@@ -122,6 +128,8 @@ def fetch_issues(org: str, repo: str) -> list[dict]:
             if issue.get("comments", 0) < min_comments:
                 continue
             if _labels_blocked(issue):
+                continue
+            if _CDKTF_RE.search(issue.get("title", "")):
                 continue
             issues.append(issue)
 
