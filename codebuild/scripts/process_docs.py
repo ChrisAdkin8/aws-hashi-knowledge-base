@@ -26,44 +26,75 @@ MIN_SECTION_SIZE = 200
 MAX_SECTION_CHARS = 4000
 
 REPO_CONFIG: dict[str, dict] = {
+    # Search the whole website/ tree so rglob covers website/docs/, website/content/,
+    # and any other nested layout used by different product repos.
     "terraform": {
-        "docs_subdirs": ["website/docs", "website/content"],
+        "docs_subdirs": ["website"],
         "source_type": "documentation",
         "product": "terraform",
         "product_family": "terraform",
     },
+    # terraform-website is a dedicated docs repo cloned by clone_repos.sh.
+    # Its content lives under content/ rather than website/.
+    "terraform-website": {
+        "docs_subdirs": ["content"],
+        "source_type": "documentation",
+        "product": "terraform",
+        "product_family": "terraform",
+    },
+    # Vault, Consul, Nomad, Terraform Enterprise, and HCP Terraform docs live in
+    # hashicorp/web-unified-docs — the individual product repos have deprecated
+    # their website/ trees. repo_dir overrides which cloned repo to read from;
+    # the config key still drives the output path and metadata product field.
     "vault": {
-        "docs_subdirs": ["website/docs", "website/content"],
+        "repo_dir": "web-unified-docs",
+        "docs_subdirs": ["content/vault"],
         "source_type": "documentation",
         "product": "vault",
         "product_family": "vault",
     },
     "consul": {
-        "docs_subdirs": ["website/docs", "website/content"],
+        "repo_dir": "web-unified-docs",
+        "docs_subdirs": ["content/consul"],
         "source_type": "documentation",
         "product": "consul",
         "product_family": "consul",
     },
     "nomad": {
-        "docs_subdirs": ["website/docs", "website/content"],
+        "repo_dir": "web-unified-docs",
+        "docs_subdirs": ["content/nomad"],
         "source_type": "documentation",
         "product": "nomad",
         "product_family": "nomad",
     },
+    "terraform-enterprise": {
+        "repo_dir": "web-unified-docs",
+        "docs_subdirs": ["content/terraform-enterprise"],
+        "source_type": "documentation",
+        "product": "terraform-enterprise",
+        "product_family": "terraform",
+    },
+    "hcp-terraform": {
+        "repo_dir": "web-unified-docs",
+        "docs_subdirs": ["content/terraform-docs-common/docs/cloud-docs"],
+        "source_type": "documentation",
+        "product": "hcp-terraform",
+        "product_family": "terraform",
+    },
     "packer": {
-        "docs_subdirs": ["website/docs", "website/content"],
+        "docs_subdirs": ["website"],
         "source_type": "documentation",
         "product": "packer",
         "product_family": "packer",
     },
     "boundary": {
-        "docs_subdirs": ["website/docs", "website/content"],
+        "docs_subdirs": ["website"],
         "source_type": "documentation",
         "product": "boundary",
         "product_family": "boundary",
     },
     "waypoint": {
-        "docs_subdirs": ["website/docs", "website/content"],
+        "docs_subdirs": ["website"],
         "source_type": "documentation",
         "product": "waypoint",
         "product_family": "waypoint",
@@ -212,7 +243,7 @@ def process_repo(repo_name: str, config: dict) -> int:
 
     Returns the number of output files written.
     """
-    repo_dir = REPOS_DIR / repo_name
+    repo_dir = REPOS_DIR / config.get("repo_dir", repo_name)
     if not repo_dir.exists():
         log.warning("Repo not found: %s — skipping", repo_dir)
         return 0

@@ -30,7 +30,7 @@
 
   <!-- Title -->
   <text x="700" y="42" text-anchor="middle" font-size="22" font-weight="700" fill="#ffffff">HashiCorp RAG Pipeline — High-Level Architecture</text>
-  <text x="700" y="64" text-anchor="middle" class="label-sm">Bedrock Knowledge Base on AWS, provisioned by Terraform</text>
+  <text x="700" y="64" text-anchor="middle" class="label-sm">Kendra RAG Pipeline on AWS, provisioned by Terraform</text>
 
   <!-- ═══════════════════════════════════════════════════════════════ -->
   <!-- ROW 1: IaC -->
@@ -108,7 +108,7 @@
 
   <rect x="110" y="346" width="200" height="46" rx="5" fill="#1e3a5f" stroke="#0369a1" stroke-width="1"/>
   <text x="210" y="364" text-anchor="middle" class="label-sm">clone_repos.sh</text>
-  <text x="210" y="380" text-anchor="middle" class="label-sm">9 core · 14 providers · 4 sentinel</text>
+  <text x="210" y="380" text-anchor="middle" class="label-sm">web-unified-docs + 6 core · 14 providers · 4 sentinel</text>
 
   <rect x="410" y="346" width="200" height="46" rx="5" fill="#1e3a5f" stroke="#0369a1" stroke-width="1"/>
   <text x="510" y="364" text-anchor="middle" class="label-sm">discover_modules.py</text>
@@ -153,7 +153,7 @@
   <!-- ═══════════════════════════════════════════════════════════════ -->
   <rect x="905" y="530" width="230" height="120" rx="8" fill="#1a1a2e" stroke="#64748b" stroke-width="1.5"/>
   <text x="1020" y="556" text-anchor="middle" class="label-md">IAM Roles</text>
-  <text x="1020" y="574" text-anchor="middle" class="label-sm">bedrock-kb · codebuild · sfn</text>
+  <text x="1020" y="574" text-anchor="middle" class="label-sm">kendra · codebuild · sfn</text>
   <text x="1020" y="592" text-anchor="middle" class="label-sm">scheduler · github-oidc</text>
   <text x="1020" y="610" text-anchor="middle" class="label-sm">Least-privilege · no static keys</text>
 
@@ -165,43 +165,43 @@
   <text x="400" y="574" text-anchor="middle" class="label-sm">{project}-rag-docs-{hash}</text>
   <text x="400" y="590" text-anchor="middle" class="label-sm">KMS encrypted · versioning</text>
   <text x="400" y="606" text-anchor="middle" class="label-sm">90-day noncurrent expiration</text>
-  <text x="400" y="622" text-anchor="middle" class="label-sm">Staging area for KB import</text>
+  <text x="400" y="622" text-anchor="middle" class="label-sm">Staging area for Kendra sync</text>
 
   <!-- Arrow CodeBuild → S3 -->
   <line x1="400" y1="488" x2="400" y2="528" stroke="#22d3ee" stroke-width="2.5" marker-end="url(#arr-cyan)"/>
   <text x="452" y="514" class="label-sm" fill="#22d3ee">aws s3 sync --delete</text>
 
-  <!-- Arrow S3 → Bedrock KB -->
+  <!-- Arrow S3 → Kendra -->
   <line x1="400" y1="650" x2="400" y2="688" stroke="#f59e0b" stroke-width="2.5" marker-end="url(#arr-yellow)"/>
-  <text x="420" y="675" class="label-sm" fill="#fcd34d">import</text>
+  <text x="420" y="675" class="label-sm" fill="#fcd34d">sync</text>
 
   <!-- ═══════════════════════════════════════════════════════════════ -->
-  <!-- Bedrock Knowledge Base (Vector Store) -->
+  <!-- Amazon Kendra (Retrieval Index) -->
   <!-- ═══════════════════════════════════════════════════════════════ -->
-  <text x="80" y="682" class="section-title">VECTOR STORE</text>
+  <text x="80" y="682" class="section-title">RETRIEVAL INDEX</text>
 
   <rect x="80" y="690" width="1260" height="130" rx="10" fill="#1a0a2e" stroke="#a855f7" stroke-width="2.5"/>
-  <text x="700" y="716" text-anchor="middle" class="label-xl" fill="#d8b4fe">Bedrock Knowledge Base</text>
+  <text x="700" y="716" text-anchor="middle" class="label-xl" fill="#d8b4fe">Amazon Kendra</text>
 
   <rect x="170" y="732" width="210" height="68" rx="6" fill="#2e1065" stroke="#7c3aed" stroke-width="1.5"/>
-  <text x="275" y="756" text-anchor="middle" class="label-md" fill="#c4b5fd">Embedding</text>
-  <text x="275" y="773" text-anchor="middle" class="label-sm">Titan Embed V2</text>
-  <text x="275" y="788" text-anchor="middle" class="label-sm">1024-token chunks · 20% overlap</text>
+  <text x="275" y="756" text-anchor="middle" class="label-md" fill="#c4b5fd">NLP Indexing</text>
+  <text x="275" y="773" text-anchor="middle" class="label-sm">Entity recognition</text>
+  <text x="275" y="788" text-anchor="middle" class="label-sm">Keyword extraction · no embeddings</text>
 
   <rect x="460" y="732" width="210" height="68" rx="6" fill="#2e1065" stroke="#7c3aed" stroke-width="1.5"/>
-  <text x="565" y="756" text-anchor="middle" class="label-md" fill="#c4b5fd">Vector Store</text>
-  <text x="565" y="773" text-anchor="middle" class="label-sm">OpenSearch Serverless</text>
-  <text x="565" y="788" text-anchor="middle" class="label-sm">HNSW · faiss · 2 OCU min</text>
+  <text x="565" y="756" text-anchor="middle" class="label-md" fill="#c4b5fd">Document Store</text>
+  <text x="565" y="773" text-anchor="middle" class="label-sm">S3 Data Source</text>
+  <text x="565" y="788" text-anchor="middle" class="label-sm">Kendra-managed index</text>
 
   <rect x="750" y="732" width="210" height="68" rx="6" fill="#2e1065" stroke="#7c3aed" stroke-width="1.5"/>
-  <text x="855" y="756" text-anchor="middle" class="label-md" fill="#c4b5fd">Retrieval</text>
-  <text x="855" y="773" text-anchor="middle" class="label-sm">Hybrid search (vector + BM25)</text>
-  <text x="855" y="788" text-anchor="middle" class="label-sm">min_score: 0.5</text>
+  <text x="855" y="756" text-anchor="middle" class="label-md" fill="#c4b5fd">Search</text>
+  <text x="855" y="773" text-anchor="middle" class="label-sm">Keyword + semantic</text>
+  <text x="855" y="788" text-anchor="middle" class="label-sm">NLP ranking</text>
 
   <rect x="1040" y="732" width="210" height="68" rx="6" fill="#2e1065" stroke="#7c3aed" stroke-width="1.5"/>
   <text x="1145" y="756" text-anchor="middle" class="label-md" fill="#c4b5fd">Metadata Filter</text>
   <text x="1145" y="773" text-anchor="middle" class="label-sm">source_type · product</text>
-  <text x="1145" y="788" text-anchor="middle" class="label-sm">product_family · .jsonl sidecars</text>
+  <text x="1145" y="788" text-anchor="middle" class="label-sm">product_family · .metadata.json</text>
 
   <!-- Inter-box arrows inside Bedrock KB -->
   <line x1="380" y1="766" x2="458" y2="766" stroke="#a855f7" stroke-width="1.5" marker-end="url(#arr-purple)"/>

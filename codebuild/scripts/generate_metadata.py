@@ -59,14 +59,14 @@ def _infer_metadata(path: Path, bucket: str) -> dict:
     s3_uri = f"s3://{bucket}/{s3_key}"
     title = path.stem.replace("_", " ").title()
 
-    # Schema Fix: Reserved system attributes like _source_uri MUST be 
-    # nested inside the Attributes object, alongside custom attributes.
+    # _source_uri is intentionally omitted: Kendra requires it to be an
+    # HTTP/HTTPS URL, but we only have s3:// URIs at this stage. When absent,
+    # Kendra's search results link directly to the S3 object instead.
     return {
         "DocumentId": s3_uri,
         "Title": title,
         "ContentType": "PLAIN_TEXT",
         "Attributes": {
-            "_source_uri": s3_uri,
             "product": product or "unknown",
             "product_family": product_family or "unknown",
             "source_type": source_type or "unknown"

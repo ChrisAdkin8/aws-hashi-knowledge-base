@@ -4,9 +4,9 @@ locals {
   account_id      = data.aws_caller_identity.current.account_id
   rag_bucket_name = "hashicorp-rag-docs-${var.region}-${substr(sha256(local.account_id), 0, 8)}"
 
-  # FIX: Index 0 is the Index ID, Index 1 is the Data Source ID. 
-  # Step Functions needs the Data Source ID to trigger the sync.
-  kendra_data_source_id = split("/", aws_kendra_data_source.s3.id)[1]
+  # The aws_kendra_data_source id format is "<data_source_id>/<index_id>".
+  # Step Functions needs the Data Source ID (element 0) to trigger the sync.
+  kendra_data_source_id = split("/", aws_kendra_data_source.s3.id)[0]
 }
 
 # ── S3 Bucket (RAG document staging) ──────────────────────────────────────────
@@ -56,6 +56,10 @@ resource "aws_kendra_index" "main" {
   edition  = var.kendra_edition
   role_arn = aws_iam_role.kendra.arn
 
+  # ==========================================
+  # --- YOUR CUSTOM METADATA FIELDS ---
+  # ==========================================
+
   document_metadata_configuration_updates {
     name = "product"
     type = "STRING_VALUE"
@@ -65,6 +69,7 @@ resource "aws_kendra_index" "main" {
       searchable  = true
       sortable    = false
     }
+    relevance { importance = 1 }
   }
 
   document_metadata_configuration_updates {
@@ -76,6 +81,7 @@ resource "aws_kendra_index" "main" {
       searchable  = true
       sortable    = false
     }
+    relevance { importance = 1 }
   }
 
   document_metadata_configuration_updates {
@@ -87,9 +93,9 @@ resource "aws_kendra_index" "main" {
       searchable  = true
       sortable    = false
     }
+    relevance { importance = 1 }
   }
 }
-
 resource "aws_kendra_data_source" "s3" {
   index_id = aws_kendra_index.main.id
   name     = "hashicorp-docs-s3"
@@ -265,7 +271,6 @@ resource "aws_iam_role_policy" "step_functions" {
         Resource = [aws_codebuild_project.rag_pipeline.arn]
       },
       {
-        # FIX: Simplified resource scoping for Query/Retrieve
         Effect = "Allow"
         Action = [
           "kendra:StartDataSourceSyncJob",
@@ -288,7 +293,11 @@ resource "aws_iam_role_policy" "step_functions" {
           "events:DeleteRule",
           "events:RemoveTargets",
         ]
-        Resource = ["*"]
+        Resource = [
+          "*",
+          # FIX: Explicitly allow Step Functions to create the managed rule for CodeBuild .sync integration
+          "arn:aws:events:${var.region}:${local.account_id}:rule/StepFunctionsGetEventsForCodeBuildStartBuildRule"
+        ]
       },
     ]
   })
@@ -417,6 +426,10 @@ resource "aws_sfn_state_machine" "rag_pipeline" {
   definition = templatefile("${path.module}/../step-functions/rag_pipeline.asl.json", {
     codebuild_project_name = aws_codebuild_project.rag_pipeline.name
   })
+
+  depends_on = [
+    aws_iam_role_policy.step_functions
+  ]
 }
 
 # ── EventBridge Scheduler ─────────────────────────────────────────────────────

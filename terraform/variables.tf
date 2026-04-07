@@ -7,7 +7,7 @@ variable "region" {
 variable "kendra_edition" {
   description = "Kendra index edition. DEVELOPER_EDITION (~$810/mo) or ENTERPRISE_EDITION (~$1400/mo)."
   type        = string
-  default     = "DEVELOPER_EDITION"
+  default     = "ENTERPRISE_EDITION"
 }
 
 variable "refresh_schedule" {

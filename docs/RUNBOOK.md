@@ -1,6 +1,6 @@
-# Operational Runbook — HashiCorp Bedrock RAG Pipeline
+# Operational Runbook — HashiCorp Kendra RAG Pipeline
 
-This runbook covers day-to-day operations, failure diagnosis, and recovery procedures for the HashiCorp RAG pipeline running on Amazon Bedrock.
+This runbook covers day-to-day operations, failure diagnosis, and recovery procedures for the HashiCorp RAG pipeline running on Amazon Kendra and Amazon Bedrock.
 
 ---
 
@@ -11,10 +11,10 @@ This runbook covers day-to-day operations, failure diagnosis, and recovery proce
 | Step Functions | `https://console.aws.amazon.com/states/home?region=REGION#/statemachines` |
 | CodeBuild history | `https://console.aws.amazon.com/codesuite/codebuild/projects?region=REGION` |
 | CloudWatch Logs (CodeBuild) | `https://console.aws.amazon.com/cloudwatch/home?region=REGION#logsV2:log-groups/log-group/$252Faws$252Fcodebuild$252Frag-hashicorp-pipeline` |
-| Bedrock Knowledge Base | `https://console.aws.amazon.com/bedrock/home?region=REGION#/knowledge-bases` |
-| OpenSearch Serverless | `https://console.aws.amazon.com/aos/home?region=REGION#/collections` |
+| Amazon Kendra | `https://console.aws.amazon.com/kendra/home?region=REGION` |
+| S3 RAG bucket | `https://s3.console.aws.amazon.com/s3/buckets/hashicorp-rag-docs-REGION-SUFFIX` |
 
-Replace `REGION` with your deployment region (default: `us-west-2`).
+Replace `REGION` with your deployment region (default: `us-east-1`).
 
 ---
 
@@ -24,29 +24,30 @@ Replace `REGION` with your deployment region (default: `us-west-2`).
 
 ```bash
 task pipeline:run
-# or with explicit IDs if tf output unavailable:
-task pipeline:run KB_ID=ABCDEFGHIJ DS_ID=KLMNOPQRST
+# or with explicit IDs if terraform output is unavailable:
+task pipeline:run KENDRA_INDEX_ID=<INDEX_ID> KENDRA_DS_ID=<DATA_SOURCE_ID>
 ```
 
 ### Check pipeline status
 
 ```bash
 aws stepfunctions list-executions \
-  --state-machine-arn arn:aws:states:REGION:ACCOUNT_ID:stateMachine:rag-hashicorp-pipeline \
+  --state-machine-arn $(terraform -chdir=terraform output -raw state_machine_arn) \
   --max-results 5
 ```
 
 ### Validate retrieval quality
 
 ```bash
-task pipeline:test KB_ID=ABCDEFGHIJ
+task pipeline:test KENDRA_INDEX_ID=$(terraform -chdir=terraform output -raw kendra_index_id)
 ```
 
 ### Re-ingest after adding new content sources
 
 1. Update `codebuild/scripts/clone_repos.sh` or the appropriate fetch script.
-2. Commit and push.
-3. Run `task pipeline:run` to trigger a full re-ingest.
+2. Update `codebuild/scripts/process_docs.py` if the new repo requires a custom `docs_subdirs` entry.
+3. Commit and push.
+4. Run `task pipeline:run` to trigger a full re-ingest.
 
 ---
 
@@ -54,33 +55,47 @@ task pipeline:test KB_ID=ABCDEFGHIJ
 
 ### CodeBuild build failed
 
-1. Check the CloudWatch Logs group `/aws/codebuild/rag-hashicorp-pipeline`.
+1. Open CloudWatch Logs → `/aws/codebuild/rag-hashicorp-pipeline` and find the failing build stream.
 2. Common causes:
    - **Git clone failure** — transient network issue; re-run the pipeline.
-   - **Python import error** — missing dependency in `codebuild/scripts/requirements.txt`.
+   - **Python import error** — missing dependency; add to `codebuild/scripts/requirements.txt`.
    - **S3 upload permission denied** — verify the CodeBuild IAM role has `s3:PutObject` on the RAG bucket.
-   - **GitHub rate limit** — unauthenticated API limit (60 req/hr). Add `GITHUB_TOKEN` to Secrets Manager.
+   - **GitHub rate limit** — unauthenticated API limit (60 req/hr); add `GITHUB_TOKEN` to Secrets Manager.
+   - **No markdown files found for a product** — the repo may have changed its docs directory layout; update `docs_subdirs` in `process_docs.py`.
 
-### Bedrock ingestion job failed
+### Kendra sync failed
 
-1. In the Step Functions console, expand the `GetIngestionStatus` state output to find `IngestionJob.FailureReasons`.
-2. Common causes:
-   - **S3 object format** — Bedrock rejects non-UTF-8 files. Check for binary files in the RAG bucket.
-   - **Vector index missing** — the OpenSearch index was not created before the first ingestion. Run `create_knowledge_base.py` again.
-   - **IAM permission** — the Bedrock KB role needs `aoss:APIAccessAll` on the collection. Verify with `task output`.
+1. In the Step Functions console, find the failed `StartSync` or `ListSyncJobs` state and expand its output for the error.
+2. In the Kendra console → your index → Data sources → sync history, expand the failed sync for `FailureReasons`.
+3. Common causes:
+   - **ResourceNotFoundException on data source** — the `kendra_data_source_id` Terraform output may be stale. Run `terraform -chdir=terraform output` and verify `kendra_data_source_id` differs from `kendra_index_id`. If they match, the `split()` index in `main.tf` is wrong — check the fix in commit history.
+   - **AccessDeniedException** — the Kendra S3 role lacks `s3:GetObject` or `s3:ListBucket` on the RAG bucket.
+   - **Invalid metadata sidecar** — a `.metadata.json` file is malformed. Check `generate_metadata.py` output.
+   - **Index capacity exceeded** — the index has hit the edition document limit (10,000 for Developer, 100,000/SCU for Enterprise). Check the Kendra console → index metrics.
 
 ### Zero retrieval results
 
-1. Run `task pipeline:test KB_ID=ABCDEFGHIJ` — check which topics return 0 results.
-2. Verify the ingestion job completed successfully (check Bedrock console → Knowledge Base → Sync jobs).
-3. Check that the S3 bucket contains documents: `aws s3 ls s3://BUCKET_NAME/ --recursive | head -20`.
-4. If the bucket is empty, the CodeBuild build may have run but the upload step failed — check CloudWatch Logs.
+1. Run `task pipeline:test KENDRA_INDEX_ID=<INDEX_ID>` — check which topics return 0 results.
+2. Verify the last Kendra sync succeeded: Kendra console → index → Data sources → last sync status.
+3. Check that the S3 bucket contains documents for the missing product:
+   ```bash
+   aws s3 ls s3://$(terraform -chdir=terraform output -raw rag_bucket_name)/documentation/ --region us-east-1
+   ```
+4. If a product folder is missing, the CodeBuild job found no markdown in its docs path — check CloudWatch Logs for `No markdown files found in <repo>`.
+
+### Kendra index at capacity (Developer Edition)
+
+The Developer Edition is capped at 10,000 documents. Switch to Enterprise Edition:
+
+1. Change `kendra_edition` default to `ENTERPRISE_EDITION` in `terraform/variables.tf`.
+2. Run `terraform -chdir=terraform apply -auto-approve` — Terraform will destroy and recreate the Kendra index (10–30 minutes).
+3. Re-run `task pipeline:run` to re-sync all documents into the new index.
 
 ### EventBridge Scheduler not triggering
 
 1. Check the scheduler: `aws scheduler get-schedule --name rag-weekly-refresh`.
-2. Verify the scheduler IAM role has `states:StartExecution` on the state machine.
-3. Check for failed targets in CloudWatch: look for `SchedulerInvocationError` events.
+2. Verify the scheduler IAM role has `states:StartExecution` on the state machine ARN.
+3. Look for `SchedulerInvocationError` events in CloudWatch.
 
 ---
 
@@ -94,17 +109,8 @@ aws scheduler update-schedule \
   --state DISABLED \
   --schedule-expression "cron(0 2 ? * SUN *)" \
   --flexible-time-window '{"Mode":"OFF"}' \
-  --target '{"Arn":"STATE_MACHINE_ARN","RoleArn":"SCHEDULER_ROLE_ARN"}'
+  --target "{\"Arn\":\"$(terraform -chdir=terraform output -raw state_machine_arn)\",\"RoleArn\":\"SCHEDULER_ROLE_ARN\"}"
 ```
-
-### Delete the Knowledge Base (stops OpenSearch OCU billing)
-
-```bash
-# WARNING: This deletes all indexed content. Re-run the pipeline to rebuild.
-aws bedrock-agent delete-knowledge-base --knowledge-base-id ABCDEFGHIJ
-```
-
-OpenSearch Serverless collections continue billing (~$350/mo) even with no KB attached. Delete the collection in the console or via Terraform to stop all vector store billing.
 
 ### Full teardown
 
@@ -112,13 +118,15 @@ OpenSearch Serverless collections continue billing (~$350/mo) even with no KB at
 task destroy
 ```
 
-This destroys all Terraform-managed resources. The Knowledge Base is **not** managed by Terraform and must be deleted separately (see above).
+This destroys all Terraform-managed resources including the Kendra index, S3 bucket, CodeBuild project, Step Functions state machine, and EventBridge scheduler.
+
+> **Note:** Unlike Bedrock Knowledge Bases, the Kendra index **is** managed by Terraform. `task destroy` removes everything.
 
 ---
 
 ## Adding a GitHub Token
 
-Store the token in Secrets Manager and tag it so the CodeBuild IAM policy can access it:
+Store the token in Secrets Manager so CodeBuild can raise the GitHub API rate limit from 60 to 5,000 requests/hour:
 
 ```bash
 aws secretsmanager create-secret \
@@ -127,7 +135,7 @@ aws secretsmanager create-secret \
   --tags Key=Project,Value=hashicorp-rag-pipeline
 ```
 
-The `buildspec.yml` already references `github-token:token` in its `secrets-manager` block. No other changes are required.
+Uncomment the `secrets-manager` block in `codebuild/buildspec.yml` to activate it. No other changes are required.
 
 ---
 
@@ -142,13 +150,15 @@ task apply   # apply
 
 ### CodeBuild script changes
 
-Commit and push. The next pipeline run will pick up the latest scripts from the repository (CodeBuild clones the repo on every build).
+Commit and push. The next pipeline run will pick up the latest scripts — CodeBuild clones this repository fresh on every build using the `REPO_URL` environment variable.
 
-### Modifying chunking parameters
+### Adding new product documentation
 
-Edit `chunk_size` and `chunk_overlap_pct` in `terraform/terraform.tfvars`, then:
+For products whose docs live in `hashicorp/web-unified-docs` (Vault, Consul, Nomad, Terraform Enterprise, HCP Terraform):
+1. Add a REPO_CONFIG entry in `process_docs.py` with `"repo_dir": "web-unified-docs"` and the correct `docs_subdirs` path (e.g. `["content/myproduct"]`).
+2. Commit, push, and run `task pipeline:run`.
 
-```bash
-task plan && task apply   # updates the data source configuration
-task pipeline:run         # re-ingest with new chunking
-```
+For products with their own GitHub repo:
+1. Add the repo to `clone_repos.sh` CORE_REPOS.
+2. Add a config entry in `process_docs.py` REPO_CONFIG with the appropriate `docs_subdirs`.
+3. Commit, push, and run `task pipeline:run`.

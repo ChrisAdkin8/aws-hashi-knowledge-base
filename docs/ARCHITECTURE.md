@@ -1,8 +1,10 @@
-# Architecture — HashiCorp Bedrock RAG Pipeline
+# Architecture — HashiCorp Kendra RAG Pipeline
 
 ## Overview
 
-A production-grade pipeline that ingests HashiCorp documentation into an Amazon Bedrock Knowledge Base for use as a grounding source in AI coding assistants. The pipeline runs weekly via EventBridge Scheduler and self-heals from transient failures via Step Functions retry logic.
+A production-grade pipeline that ingests HashiCorp documentation into **Amazon Kendra** for use as a grounding source in AI coding assistants powered by **Amazon Bedrock** (Claude). The pipeline runs weekly via EventBridge Scheduler and self-heals from transient failures via Step Functions retry logic.
+
+Kendra provides NLP-powered retrieval — no embedding model, vector database, or chunking configuration is required. Documents are pre-split semantically by the ingestion pipeline to improve passage quality.
 
 ## Components
 
@@ -10,32 +12,39 @@ A production-grade pipeline that ingests HashiCorp documentation into an Amazon 
 
 | Component | Role |
 |---|---|
-| **EventBridge Scheduler** | Cron trigger — fires weekly, passes input JSON to Step Functions |
-| **Step Functions** | Pipeline orchestrator — 5-state ASL machine: Init → StartBuild → StartIngestionJob → WaitForIngestion → ValidateRetrieval |
+| **EventBridge Scheduler** | Cron trigger — fires weekly (default: Sundays 02:00 UTC), passes input JSON to Step Functions |
+| **Step Functions** | Pipeline orchestrator — 8-state ASL machine: Init → StartBuild → StartSync → WaitForSync → ListSyncJobs → CheckSyncStatus → ValidateRetrieval → PipelineComplete |
 
 ### Data Ingestion
 
 | Component | Role |
 |---|---|
-| **AWS CodeBuild** | Runs data processing scripts inside an isolated Linux container (7 GB, 4 vCPU) |
-| **Amazon S3** | Staging area for processed markdown documents and metadata sidecar files |
+| **AWS CodeBuild** | Runs data processing scripts inside an isolated Linux container (`BUILD_GENERAL1_MEDIUM`, 7 GB RAM, 4 vCPU) |
+| **Amazon S3** | Staging area for processed markdown documents and Kendra metadata sidecar files (`.metadata.json`) |
+| **`hashicorp/web-unified-docs`** | Single GitHub repo that is the authoritative documentation source for Vault, Consul, Nomad, Terraform Enterprise, and HCP Terraform. Docs live under `content/{product}/`. Individual product repos (`hashicorp/vault` etc.) have deprecated their `website/` trees. |
 
-### Knowledge Base
+### Retrieval Index
 
 | Component | Role |
 |---|---|
-| **Amazon Bedrock Knowledge Base** | Managed RAG service — owns the embedding pipeline and retrieval API |
-| **Amazon OpenSearch Serverless** | Vector store — stores embeddings for semantic search |
-| **Titan Embeddings V2** | Embedding model — 1024-dimension dense vectors |
+| **Amazon Kendra** | Managed retrieval service — indexes S3 documents using built-in NLP, serves keyword + semantic queries |
+| **Kendra S3 Data Source** | Watches the RAG S3 bucket; syncs new and changed documents on each pipeline run |
+
+### AI Inference
+
+| Component | Role |
+|---|---|
+| **Amazon Bedrock** | Hosts Claude models for AI inference — used at query time, not ingestion time |
+| **MCP Server** (`mcp/server.py`) | Bridges Claude Code to Kendra via the Model Context Protocol; exposes `search_hashicorp_docs` and `get_index_info` tools |
 
 ### Supporting Infrastructure
 
 | Component | Role |
 |---|---|
 | **IAM Roles** | Least-privilege execution roles for each service |
-| **CloudWatch Logs** | Build logs from CodeBuild; Step Functions execution logs |
-| **SNS + CloudWatch Alarms** | Optional email alerts on pipeline failure (set `notification_email`) |
-| **GitHub Actions (OIDC)** | CI/CD via OIDC federation — no long-lived IAM keys |
+| **CloudWatch Logs** | Build logs from CodeBuild; Step Functions execution history |
+| **SNS + CloudWatch Alarms** | Optional email alerts on pipeline failure (set `notification_email` variable) |
+| **GitHub Actions (OIDC)** | CI/CD via OIDC federation — no long-lived IAM keys (set `create_github_oidc_provider = true`) |
 
 ## Data Flow
 
@@ -44,31 +53,34 @@ EventBridge Scheduler
     │  weekly cron (cron(0 2 ? * SUN *))
     ▼
 Step Functions: Init
-    │  inject validation queries + params
+    │  inject validation queries + params (index ID, data source ID, bucket, repo URL)
     ▼
 Step Functions: StartBuild
-    │  codebuild:startBuild.sync (auto-polls via CloudWatch Events)
+    │  codebuild:startBuild.sync — waits for CodeBuild to complete
     ▼
 CodeBuild
-    ├── pre_build: clone_repos.sh, discover_modules.py, clone_modules.sh
-    ├── build:     process_docs.py | fetch_github_issues.py & fetch_discuss.py & fetch_blogs.py
-    │              deduplicate.py | generate_metadata.py
-    └── post_build: aws s3 sync → S3 bucket
+    ├── pre_build:  clone_repos.sh        — shallow-clone HashiCorp + provider repos
+    │               discover_modules.py   — discover Terraform Registry modules
+    │               clone_modules.sh      — clone discovered module repos
+    ├── build:      process_docs.py       — semantic section splitting + attribution prefixes
+    │               fetch_github_issues.py & fetch_discuss.py & fetch_blogs.py  (parallel)
+    │               deduplicate.py        — cross-source deduplication
+    │               generate_metadata.py  — write Kendra .metadata.json sidecars
+    └── post_build: aws s3 sync → S3 RAG bucket (--delete keeps bucket current)
     ▼
-Step Functions: StartIngestionJob
-    │  bedrockagent:startIngestionJob
+Step Functions: StartSync
+    │  kendra:startDataSourceSyncJob — triggers Kendra to index new/changed S3 documents
     ▼
-Step Functions: WaitForIngestion (poll loop, 30s interval)
-    │  bedrockagent:getIngestionJob until COMPLETE
+Step Functions: WaitForSync (60s wait) → ListSyncJobs → CheckSyncStatus (poll loop)
+    │  kendra:listDataSourceSyncJobs until History[0].Status ∈ {SUCCEEDED, INCOMPLETE}
     ▼
-Bedrock Knowledge Base
-    │  chunk (FIXED_SIZE, 1024 tokens, 20% overlap)
-    │  embed (Titan Embeddings V2, 1024 dims)
-    └─ index (OpenSearch Serverless, HNSW)
+Amazon Kendra
+    │  NLP-powered index — keyword extraction, entity recognition, semantic ranking
+    └─ Custom metadata attributes: product, product_family, source_type, _source_uri
     ▼
 Step Functions: ValidateRetrieval
-    │  Map state — 10 parallel queries covering all product families
-    └─ bedrockagentruntime:retrieve (HYBRID search, top 5)
+    │  Map state — 10 sequential kendra:query calls covering all product families
+    └─ Confirms index is queryable before marking pipeline complete
     ▼
 PipelineComplete
 ```
@@ -79,25 +91,57 @@ Each service has a dedicated least-privilege execution role:
 
 | Role | Principals | Key permissions |
 |---|---|---|
-| `bedrock-kb-hashicorp-rag` | `bedrock.amazonaws.com` | `s3:GetObject`, `bedrock:InvokeModel`, `aoss:APIAccessAll` |
-| `rag-pipeline-codebuild` | `codebuild.amazonaws.com` | `s3:PutObject/GetObject/ListBucket/DeleteObject`, `logs:PutLogEvents`, `secretsmanager:GetSecretValue` |
-| `rag-pipeline-step-functions` | `states.amazonaws.com` | `codebuild:StartBuild/BatchGetBuilds`, `bedrock:StartIngestionJob/GetIngestionJob/Retrieve` |
+| `rag-pipeline-codebuild` | `codebuild.amazonaws.com` | `s3:PutObject/GetObject/ListBucket/DeleteObject`, `logs:CreateLogGroup/PutLogEvents`, `secretsmanager:GetSecretValue` |
+| `rag-pipeline-step-functions` | `states.amazonaws.com` | `codebuild:StartBuild/BatchGetBuilds`, `kendra:StartDataSourceSyncJob/ListDataSourceSyncJobs/Query` |
 | `rag-pipeline-scheduler` | `scheduler.amazonaws.com` | `states:StartExecution` |
+| `rag-kendra-s3` | `kendra.amazonaws.com` | `s3:GetObject/ListBucket` on the RAG bucket |
 | `github-actions-terraform` | GitHub Actions OIDC | Terraform state read/write, infra describe |
 
-## Chunking Strategy
+## Document Processing
 
-Documents go through two chunking stages:
+### Semantic pre-splitting (`process_docs.py`)
 
-1. **Semantic pre-splitting** (`process_docs.py`): markdown files split at `##`/`###` heading boundaries. Each section becomes a separate file with its own metadata attribution prefix. Sections under 200 chars are merged with the previous section. Sections over ~4000 chars are split at code-fence boundaries.
+Markdown files are split at `##`/`###` heading boundaries before upload. Each section becomes a separate file with its own Kendra metadata sidecar:
 
-2. **Bedrock fixed-size chunking**: The knowledge base data source is configured with `FIXED_SIZE` chunking (1024 tokens max, 20% overlap). Because files are already semantically split, the fixed-size chunker rarely cuts within a semantic unit.
+- Sections under 200 characters are merged into the previous section
+- Sections over ~4,000 characters are split at code-fence boundaries to avoid cutting inside code blocks
+- Each output file begins with a compact attribution prefix: `[source_type:product] Title — Section`
+
+This pre-splitting ensures Kendra receives well-bounded passages rather than whole large documents, improving retrieval precision.
+
+### Kendra metadata attributes
+
+Every document has a `.metadata.json` sidecar file written by `generate_metadata.py`. Kendra reads these automatically when syncing:
+
+```json
+{
+  "Attributes": {
+    "product":        "vault",
+    "product_family": "vault",
+    "source_type":    "documentation"
+  }
+}
+```
+
+These attributes are indexed by Kendra and available as filters in the `search_hashicorp_docs` MCP tool (`product_family`, `source_type`).
+
+## Kendra Index Configuration
+
+| Setting | Value |
+|---|---|
+| Edition | `ENTERPRISE_EDITION` (100,000 docs per SCU; 10,000 queries/day included) |
+| Data source type | S3 |
+| Sync schedule | On-demand (triggered by Step Functions after each CodeBuild run) |
+| Custom attributes | `product` (STRING), `product_family` (STRING), `source_type` (STRING) |
+
+> **Edition note:** `DEVELOPER_EDITION` is capped at 10,000 documents. This pipeline typically generates 10,000–30,000+ documents across all source types; `ENTERPRISE_EDITION` is required for production use. The edition cannot be changed in-place — changing it destroys and recreates the index.
 
 ## State Machine Design
 
-The Step Functions ASL uses:
-- `.sync` integration for CodeBuild (automatic poll via CloudWatch Events — no sleep loop)
-- Manual poll loop for Bedrock ingestion (no native `.sync` for `StartIngestionJob`)
-- `Map` state with `MaxConcurrency: 5` for parallel validation queries
-- Retry on `States.TaskFailed` for the CodeBuild step (2 retries, 30s interval, 2x backoff)
-- Catch-all error states for CodeBuild and ingestion failures
+The Step Functions ASL (`step-functions/rag_pipeline.asl.json`) uses:
+
+- `.sync` resource integration for CodeBuild — automatic poll via CloudWatch Events, no sleep loop
+- Manual poll loop for Kendra sync (60-second wait between `ListDataSourceSyncJobs` calls)
+- Sequential `Map` state (`MaxConcurrency: 1`) for the 10 validation queries — avoids Kendra query throttling
+- Retry on `States.TaskFailed` for the CodeBuild step (2 retries, 30-second interval, 2× backoff)
+- Catch-all error states for CodeBuild (`BuildFailed`), Kendra sync (`SyncFailed`), and validation (`ValidationFailed`)

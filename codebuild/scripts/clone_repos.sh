@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# clone_repos_and_extract_docs.sh — Shallow-clone HashiCorp GitHub repos and extract docs.
-# Outputs clean documentation to /codebuild/output/docs_to_sync/.
+# clone_repos.sh — Shallow-clone HashiCorp GitHub repos for documentation ingestion.
+# Core repos (vault, consul, nomad, terraform, etc.) are required: any clone failure
+# aborts the build. Provider and Sentinel repos are optional: failures are warned
+# and skipped.
 set -euo pipefail
 
 REPOS_DIR="/codebuild/output/repos"
-DOCS_DIR="/codebuild/output/docs_to_sync"
-
 mkdir -p "${REPOS_DIR}"
-mkdir -p "${DOCS_DIR}"
 
 declare -A CORE_REPOS=(
+  # web-unified-docs is the authoritative source for Vault, Consul, Nomad,
+  # Terraform Enterprise, and HCP Terraform documentation. The individual
+  # product repos (hashicorp/vault etc.) have deprecated their website/ trees.
+  ["web-unified-docs"]="https://github.com/hashicorp/web-unified-docs.git"
   ["terraform"]="https://github.com/hashicorp/terraform.git"
-  ["vault"]="https://github.com/hashicorp/vault.git"
-  ["consul"]="https://github.com/hashicorp/consul.git"
-  ["nomad"]="https://github.com/hashicorp/nomad.git"
   ["packer"]="https://github.com/hashicorp/packer.git"
   ["boundary"]="https://github.com/hashicorp/boundary.git"
   ["waypoint"]="https://github.com/hashicorp/waypoint.git"
@@ -45,86 +45,73 @@ declare -A SENTINEL_REPOS=(
   ["consul-sentinel-policies"]="https://github.com/hashicorp/consul-sentinel-policies.git"
 )
 
-clone_repo() {
+clone_repo_optional() {
   local name="$1"
   local url="$2"
   local dest="${REPOS_DIR}/${name}"
-
   if [[ -d "${dest}/.git" ]]; then
     echo "Skipping ${name} — already cloned"
     return 0
   fi
-
-  echo "Cloning ${name}..."
+  echo "Cloning optional repo ${name}..."
   git clone --depth 1 --single-branch "${url}" "${dest}" 2>&1 || {
     echo "WARN: Failed to clone ${name} from ${url} — skipping"
   }
 }
 
-export -f clone_repo
-export REPOS_DIR
-
-echo "==> Phase 1: Parallel Cloning"
-pids=()
+# ─── Phase 1: Core repos (required — build fails if any clone fails) ───────────
+echo "==> Phase 1: Cloning core repos (required)"
+core_pids=()
 
 for name in "${!CORE_REPOS[@]}"; do
-  clone_repo "${name}" "${CORE_REPOS[$name]}" &
-  pids+=($!)
+  dest="${REPOS_DIR}/${name}"
+  if [[ -d "${dest}/.git" ]]; then
+    echo "Skipping ${name} — already cloned"
+    continue
+  fi
+  echo "Cloning ${name}..."
+  git clone --depth 1 --single-branch "${CORE_REPOS[$name]}" "${dest}" 2>&1 &
+  core_pids+=($!)
 done
 
+core_failed=0
+for pid in "${core_pids[@]}"; do
+  if ! wait "${pid}"; then
+    core_failed=$((core_failed + 1))
+  fi
+done
+
+if [[ "${core_failed}" -gt 0 ]]; then
+  echo "ERROR: ${core_failed} core repo clone(s) failed — aborting build"
+  exit 1
+fi
+echo "Core repos cloned successfully."
+
+# ─── Phase 2: Optional repos (provider + sentinel — failures are non-fatal) ───
+echo ""
+echo "==> Phase 2: Cloning optional repos (provider + sentinel)"
+opt_pids=()
+
 for name in "${!PROVIDER_REPOS[@]}"; do
-  clone_repo "${name}" "${PROVIDER_REPOS[$name]}" &
-  pids+=($!)
+  clone_repo_optional "${name}" "${PROVIDER_REPOS[$name]}" &
+  opt_pids+=($!)
 done
 
 for name in "${!SENTINEL_REPOS[@]}"; do
-  clone_repo "${name}" "${SENTINEL_REPOS[$name]}" &
-  pids+=($!)
+  clone_repo_optional "${name}" "${SENTINEL_REPOS[$name]}" &
+  opt_pids+=($!)
 done
 
-# Wait for all parallel clones to complete
-failed=0
-for pid in "${pids[@]}"; do
+opt_failed=0
+for pid in "${opt_pids[@]}"; do
   if ! wait "${pid}"; then
-    failed=$((failed + 1))
+    opt_failed=$((opt_failed + 1))
   fi
 done
 
-if [[ "${failed}" -gt 0 ]]; then
-  echo "WARN: ${failed} clone(s) failed — check output above. Continuing with available repos."
+if [[ "${opt_failed}" -gt 0 ]]; then
+  echo "WARN: ${opt_failed} optional repo clone(s) failed — continuing with available repos"
 fi
-echo "Clone phase complete."
 
 echo ""
-echo "==> Phase 2: Extracting Markdown Documentation"
-# This step pulls only .md and .mdx files, preserving the directory structure
-# so files with the same name (like README.md) don't overwrite each other.
-
-for repo_path in "${REPOS_DIR}"/*; do
-  if [[ -d "${repo_path}" ]]; then
-    repo_name=$(basename "${repo_path}")
-    target_dir="${DOCS_DIR}/${repo_name}"
-    
-    mkdir -p "${target_dir}"
-    
-    # Use find and copy to grab only the markdown files and ignore Go source code
-    # The 'cp --parents' flag ensures we keep the folder structure intact.
-    # Note: Using subshell (cd ...) so paths remain relative inside the target dir.
-    (
-      cd "${repo_path}"
-      find . -type f \( -name "*.md" -o -name "*.mdx" \) -exec cp --parents {} "${target_dir}/" \; 2>/dev/null || true
-    )
-    
-    # Count how many docs we extracted for logging
-    doc_count=$(find "${target_dir}" -type f | wc -l)
-    echo "Extracted ${doc_count} documentation files from ${repo_name}"
-  fi
-done
-
-echo ""
-echo "==> Done!"
-echo "Raw repositories are in: ${REPOS_DIR}"
-echo "Clean documentation ready for S3/Kendra is in: ${DOCS_DIR}"
-
-# Optional: Uncomment the next line if you want to free up space in CodeBuild by deleting the raw Go code
-# rm -rf "${REPOS_DIR}"
+echo "==> Clone phase complete. Repositories are in: ${REPOS_DIR}"
