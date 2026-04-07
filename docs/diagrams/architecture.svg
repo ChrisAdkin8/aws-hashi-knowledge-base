@@ -76,7 +76,7 @@
   <!-- Step Functions -->
   <rect x="1090" y="112" width="230" height="72" rx="8" fill="#172554" stroke="#38bdf8" stroke-width="2.5"/>
   <text x="1205" y="143" text-anchor="middle" class="label-xl">Step Functions</text>
-  <text x="1205" y="161" text-anchor="middle" class="label-sm">6-step pipeline orchestration</text>
+  <text x="1205" y="161" text-anchor="middle" class="label-sm">8-state pipeline orchestration</text>
   <text x="1205" y="175" text-anchor="middle" class="label-sm">Durable execution · .sync for CodeBuild</text>
 
   <!-- ═══════════════════════════════════════════════════════════════ -->
@@ -119,7 +119,7 @@
   <rect x="110" y="410" width="500" height="52" rx="5" fill="#1c3151" stroke="#0369a1" stroke-width="1"/>
   <text x="360" y="430" text-anchor="middle" class="label-md" fill="#7dd3fc">process_docs.py</text>
   <text x="360" y="445" text-anchor="middle" class="label-sm">Section split · metadata enrichment · URL attribution</text>
-  <text x="360" y="457" text-anchor="middle" class="label-sm">doc_category · resource_type · product_family</text>
+  <text x="360" y="457" text-anchor="middle" class="label-sm">product · product_family · source_type</text>
 
   <line x1="210" y1="392" x2="210" y2="408" stroke="#38bdf8" stroke-width="1.5" marker-end="url(#arr-cyan)"/>
   <line x1="510" y1="392" x2="510" y2="408" stroke="#38bdf8" stroke-width="1.5" marker-end="url(#arr-cyan)"/>
@@ -216,8 +216,8 @@
   <rect x="80" y="880" width="1260" height="72" rx="8" fill="#0a0a0f" stroke="#334155" stroke-width="1.5"/>
 
   <rect x="150" y="890" width="250" height="52" rx="6" fill="#0d1f12" stroke="#22c55e" stroke-width="1.5"/>
-  <text x="275" y="912" text-anchor="middle" class="label-md" fill="#86efac">Bedrock Agent</text>
-  <text x="275" y="928" text-anchor="middle" class="label-sm">Native KB grounding</text>
+  <text x="275" y="912" text-anchor="middle" class="label-md" fill="#86efac">AWS SDK / boto3</text>
+  <text x="275" y="928" text-anchor="middle" class="label-sm">kendra.query() + bedrock.converse()</text>
 
   <rect x="440" y="890" width="250" height="52" rx="6" fill="#0d1a2e" stroke="#60a5fa" stroke-width="1.5"/>
   <text x="565" y="912" text-anchor="middle" class="label-md" fill="#93c5fd">Claude Code</text>
