@@ -9,6 +9,7 @@
 #     --kendra-data-source-id KLMNOPQRST \
 #     --bucket-name hashicorp-rag-docs-us-east-1-a1b2c3d4 \
 #     --repo-url https://github.com/org/repo \
+#     [--target all|docs|registry|discuss|blogs]
 #     [--wait]
 set -euo pipefail
 
@@ -18,11 +19,12 @@ KENDRA_INDEX_ID=""
 KENDRA_DS_ID=""
 BUCKET_NAME=""
 REPO_URL=""
+TARGET="all"
 WAIT=false
 POLL_INTERVAL=30
 
 usage() {
-  echo "Usage: $0 --state-machine-arn ARN --kendra-index-id ID --kendra-data-source-id ID --bucket-name NAME --repo-url URL [--region REGION] [--wait]"
+  echo "Usage: $0 --state-machine-arn ARN --kendra-index-id ID --kendra-data-source-id ID --bucket-name NAME --repo-url URL [--region REGION] [--target all|docs|registry|discuss|blogs] [--wait]"
   exit 1
 }
 
@@ -34,6 +36,7 @@ while [[ $# -gt 0 ]]; do
     --kendra-data-source-id) KENDRA_DS_ID="$2";      shift 2 ;;
     --bucket-name)           BUCKET_NAME="$2";       shift 2 ;;
     --repo-url)              REPO_URL="$2";          shift 2 ;;
+    --target)                TARGET="$2";            shift 2 ;;
     --wait)                  WAIT=true;              shift 1 ;;
     -h|--help)               usage ;;
     *) echo "Unknown argument: $1"; usage ;;
@@ -44,6 +47,11 @@ if [[ -z "${STATE_MACHINE_ARN}" || -z "${KENDRA_INDEX_ID}" || -z "${KENDRA_DS_ID
   echo "ERROR: --state-machine-arn, --kendra-index-id, and --kendra-data-source-id are required"
   usage
 fi
+
+case "${TARGET}" in
+  all|docs|registry|discuss|blogs) ;;
+  *) echo "ERROR: --target must be one of: all, docs, registry, discuss, blogs"; exit 1 ;;
+esac
 
 # Derive the actual SFN region from the ARN (format: arn:aws:states:<region>:<acct>:stateMachine:<name>)
 SFN_REGION=$(echo "${STATE_MACHINE_ARN}" | cut -d: -f4)
@@ -60,6 +68,7 @@ print(json.dumps({
   'bucket_name':           '${BUCKET_NAME}',
   'repo_url':              '${REPO_URL}',
   'region':                '${SFN_REGION}',
+  'pipeline_target':       '${TARGET}',
 }))
 ")
 

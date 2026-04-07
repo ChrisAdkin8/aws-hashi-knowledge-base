@@ -209,11 +209,22 @@ tasks:
       The state machine ARN, Kendra Index ID, and Data Source ID are
       auto-detected from Terraform output when not explicitly provided.
 
+      TARGET controls which content sources are ingested (default: all):
+        all       — full pipeline (docs + registry modules + discuss + blogs + issues)
+        docs      — product documentation from HashiCorp repos only
+        registry  — Terraform public registry modules only
+        discuss   — HashiCorp Discuss threads only
+        blogs     — HashiCorp blog posts only
+
       Example:
         task pipeline:run
-        task pipeline:run KENDRA_INDEX_ID=ABCDEFGHIJ KENDRA_DS_ID=KLMNOPQRST
+        task pipeline:run TARGET=blogs
+        task pipeline:run TARGET=discuss
+        task pipeline:run TARGET=registry
+        task pipeline:run KENDRA_INDEX_ID=ABCDEFGHIJ KENDRA_DS_ID=KLMNOPQRST TARGET=docs
     deps: [init]
     vars:
+      TARGET: '{{.TARGET | default "all"}}'
       STATE_MACHINE_ARN:
         sh: 'terraform -chdir={{.TF_DIR}} output -raw state_machine_arn 2>/dev/null'
       RAG_BUCKET:
@@ -232,6 +243,10 @@ tasks:
         sh: 'grep repo_uri {{.TF_DIR}}/terraform.tfvars 2>/dev/null | cut -d\" -f2 || echo ""'
     cmds:
       - |
+        case "{{.TARGET}}" in
+          all|docs|registry|discuss|blogs) ;;
+          *) echo "Error: TARGET must be one of: all, docs, registry, discuss, blogs"; exit 1 ;;
+        esac
         scripts/run_pipeline.sh \
           --state-machine-arn      {{.STATE_MACHINE_ARN}} \
           --region                 {{.REGION}} \
@@ -239,6 +254,7 @@ tasks:
           --kendra-data-source-id  {{.KENDRA_DS_ID}} \
           --bucket-name            {{.RAG_BUCKET}} \
           --repo-url               {{.REPO_URI}} \
+          --target                 {{.TARGET}} \
           --wait
 
   pipeline:test:

@@ -7,6 +7,13 @@ version: 0.2
 # env:
 #   secrets-manager:
 #     GITHUB_TOKEN: "github-token:token"
+#
+# PIPELINE_TARGET controls which content sources are ingested (default: all):
+#   all       — full pipeline (docs + registry modules + discuss + blogs + issues)
+#   docs      — product documentation from HashiCorp repos only
+#   registry  — Terraform public registry modules only
+#   discuss   — HashiCorp Discuss threads only
+#   blogs     — HashiCorp blog posts only
 
 phases:
   install:
@@ -17,21 +24,46 @@ phases:
 
   pre_build:
     commands:
-      - echo "Cloning HashiCorp repositories..."
-      - bash codebuild/scripts/clone_repos.sh
-      - python3 codebuild/scripts/discover_modules.py
-      - bash codebuild/scripts/clone_modules.sh
+      - TARGET="${PIPELINE_TARGET:-all}"
+      - echo "Pipeline target: ${TARGET}"
+      - |
+        # Clone product repos for docs and full runs
+        if [[ "$TARGET" == "all" || "$TARGET" == "docs" ]]; then
+          echo "Cloning HashiCorp repositories..."
+          bash codebuild/scripts/clone_repos.sh
+        fi
+      - |
+        # Discover and clone Terraform registry modules for registry and full runs
+        if [[ "$TARGET" == "all" || "$TARGET" == "registry" ]]; then
+          echo "Discovering Terraform registry modules..."
+          python3 codebuild/scripts/discover_modules.py
+          bash codebuild/scripts/clone_modules.sh
+        fi
 
   build:
     commands:
-      - echo "Processing documentation (semantic section splitting)..."
-      - python3 codebuild/scripts/process_docs.py
-      - echo "Fetching API sources in parallel..."
+      - TARGET="${PIPELINE_TARGET:-all}"
       - |
-        python3 codebuild/scripts/fetch_github_issues.py &
-        python3 codebuild/scripts/fetch_discuss.py &
-        python3 codebuild/scripts/fetch_blogs.py &
-        wait
+        if [[ "$TARGET" == "all" || "$TARGET" == "docs" || "$TARGET" == "registry" ]]; then
+          echo "Processing documentation (semantic section splitting)..."
+          python3 codebuild/scripts/process_docs.py
+        fi
+      - |
+        echo "Fetching API sources..."
+        PIDS=()
+        if [[ "$TARGET" == "all" ]]; then
+          python3 codebuild/scripts/fetch_github_issues.py &
+          PIDS+=($!)
+        fi
+        if [[ "$TARGET" == "all" || "$TARGET" == "discuss" ]]; then
+          python3 codebuild/scripts/fetch_discuss.py &
+          PIDS+=($!)
+        fi
+        if [[ "$TARGET" == "all" || "$TARGET" == "blogs" ]]; then
+          python3 codebuild/scripts/fetch_blogs.py &
+          PIDS+=($!)
+        fi
+        [[ ${#PIDS[@]} -gt 0 ]] && wait "${PIDS[@]}" || true
       - echo "Deduplicating across all sources..."
       - python3 codebuild/scripts/deduplicate.py
       - echo "Generating metadata sidecar files..."

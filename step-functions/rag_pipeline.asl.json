@@ -10,6 +10,7 @@
         "bucket_name.$": "$.bucket_name",
         "repo_url.$": "$.repo_url",
         "region.$": "$.region",
+        "pipeline_target.$": "$.pipeline_target",
         "validationQueries": [
           { "topic": "terraform-provider", "query": "How do I configure the AWS provider in Terraform?" },
           { "topic": "vault",              "query": "How do I generate dynamic database credentials using HashiCorp Vault?" },
@@ -32,8 +33,9 @@
       "Parameters": {
         "ProjectName": "${codebuild_project_name}",
         "EnvironmentVariablesOverride": [
-          { "Name": "RAG_BUCKET", "Value.$": "$.bucket_name", "Type": "PLAINTEXT" },
-          { "Name": "REPO_URL",   "Value.$": "$.repo_url",    "Type": "PLAINTEXT" }
+          { "Name": "RAG_BUCKET",        "Value.$": "$.bucket_name",       "Type": "PLAINTEXT" },
+          { "Name": "REPO_URL",          "Value.$": "$.repo_url",          "Type": "PLAINTEXT" },
+          { "Name": "PIPELINE_TARGET",   "Value.$": "$.pipeline_target",   "Type": "PLAINTEXT" }
         ]
       },
       "ResultPath": "$.buildResult",
