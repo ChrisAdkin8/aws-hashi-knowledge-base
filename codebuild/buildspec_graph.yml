@@ -2,9 +2,10 @@ version: 0.2
 
 # Graph pipeline buildspec — for each Terraform workspace:
 #   1. Clone the workspace repo
-#   2. terraform init (providers only; -backend=false avoids state access requirements)
-#   3. terraform graph -> DOT output
-#   4. ingest_graph.py — parse DOT and load nodes/edges into Neptune via openCypher
+#   2. Copy .tf files to a temp dir, strip any remote backend blocks
+#   3. terraform init (local state — avoids needing remote backend credentials)
+#   4. terraform graph -> DOT output
+#   5. ingest_graph.py — parse DOT and load nodes/edges into Neptune via openCypher
 #
 # Required environment variables (set by Step Functions / CodeBuild project):
 #   REPO_URI              — GitHub HTTPS URL of the Terraform workspace repo
@@ -35,19 +36,38 @@ phases:
         echo "Cloning workspace repo ${REPO_URI}..."
         git clone --depth 1 "${REPO_URI}" workspace
 
-        # Detect Terraform root: prefer terraform/ subdirectory, fall back to repo root
+        # Detect Terraform root: prefer terraform/ subdir, else repo root
         if ls workspace/terraform/*.tf 2>/dev/null | head -1 | grep -q .; then
-          TF_DIR="${CODEBUILD_SRC_DIR}/workspace/terraform"
+          SRC_TF_DIR="${CODEBUILD_SRC_DIR}/workspace/terraform"
         else
-          TF_DIR="${CODEBUILD_SRC_DIR}/workspace"
+          SRC_TF_DIR="${CODEBUILD_SRC_DIR}/workspace"
         fi
-        echo "TF_DIR=${TF_DIR}" > /tmp/build_env
-        echo "REPO_NAME=$(basename ${REPO_URI} .git)" >> /tmp/build_env
-        echo "Using Terraform root: ${TF_DIR}"
 
-        # Init providers only — skip backend to avoid state access requirements
-        cd "${TF_DIR}"
-        terraform init -input=false -no-color -backend=false 2>&1
+        # Copy .tf files to a temp dir and strip any remote backend blocks.
+        # terraform graph requires a fully-initialized backend; stripping it
+        # lets Terraform use an implicit local backend without state access.
+        GRAPH_TF_DIR=$(mktemp -d)
+        find "${SRC_TF_DIR}" -maxdepth 1 -name '*.tf' -exec cp {} "${GRAPH_TF_DIR}/" \;
+        python3 - "${GRAPH_TF_DIR}" << 'PY'
+        import sys, re, os
+        for fname in sorted(os.listdir(sys.argv[1])):
+            if not fname.endswith('.tf'):
+                continue
+            path = os.path.join(sys.argv[1], fname)
+            with open(path) as f:
+                content = f.read()
+            # Strip backend blocks (single-level braces only — sufficient for S3/remote backends)
+            cleaned = re.sub(r'\n?\s*backend\s+"[^"]+"\s*\{[^{}]*\}', '', content)
+            with open(path, 'w') as f:
+                f.write(cleaned)
+        PY
+
+        echo "GRAPH_TF_DIR=${GRAPH_TF_DIR}" > /tmp/build_env
+        echo "REPO_NAME=$(basename ${REPO_URI} .git)" >> /tmp/build_env
+        echo "Using Terraform root copy: ${GRAPH_TF_DIR}"
+
+        cd "${GRAPH_TF_DIR}"
+        terraform init -input=false -no-color 2>&1
 
   build:
     commands:
@@ -55,8 +75,8 @@ phases:
         source /tmp/build_env
         SNAPSHOT_KEY="snapshots/${REPO_NAME}/$(date -u +%Y%m%dT%H%M%SZ).dot"
 
-        echo "Extracting dependency graph from ${TF_DIR}..."
-        cd "${TF_DIR}"
+        echo "Extracting dependency graph from ${GRAPH_TF_DIR}..."
+        cd "${GRAPH_TF_DIR}"
         terraform graph > /tmp/graph.dot
         echo "DOT graph written ($(wc -l < /tmp/graph.dot) lines)"
 
