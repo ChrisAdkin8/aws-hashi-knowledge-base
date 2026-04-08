@@ -20,11 +20,11 @@ jobs:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-terraform
-          aws-region: us-west-2
+          aws-region: us-east-1
 
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "~1.9"
+          terraform_version: "~1.14"
 
       - name: Terraform fmt check
         run: terraform fmt -check -recursive

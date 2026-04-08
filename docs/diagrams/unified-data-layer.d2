@@ -1,0 +1,184 @@
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+direction: down
+
+style: {
+  fill: "#000000"
+}
+
+# ── Consumers ─────────────────────────────────────────────────────────────────
+
+claude_code: "Claude Code\n(MCP Client)" {
+  width: 220
+  shape: rectangle
+  style: { fill: "#f59e0b"; stroke: "#fcd34d"; font-color: "#ffffff"; border-radius: 6; font-size: 13; bold: true }
+}
+
+bedrock_agent: "Bedrock Agent\n(external caller)" {
+  width: 220
+  shape: rectangle
+  style: { fill: "#f59e0b"; stroke: "#fcd34d"; font-color: "#ffffff"; border-radius: 6; font-size: 13; bold: true }
+}
+
+ci_pipeline: "CI / GitHub Actions\n(automated checks)" {
+  width: 220
+  shape: rectangle
+  style: { fill: "#f59e0b"; stroke: "#fcd34d"; font-color: "#ffffff"; border-radius: 6; font-size: 13; bold: true }
+}
+
+# ── Unified query layer ────────────────────────────────────────────────────────
+
+mcp_server: "Unified MCP Server\nquery_infrastructure_knowledge()" {
+  width: 300
+  shape: rectangle
+  style: { fill: "#7c3aed"; stroke: "#a78bfa"; font-color: "#f9fafb"; border-radius: 8; font-size: 14; bold: true }
+}
+
+router: "Intent Router\nclassify: semantic | structural | hybrid" {
+  width: 280
+  shape: rectangle
+  style: { fill: "#1d4ed8"; stroke: "#60a5fa"; font-color: "#f9fafb"; border-radius: 6; font-size: 12; bold: true }
+}
+
+merger: "Result Merger & Ranker\ndeduplicate · score · truncate" {
+  width: 280
+  shape: rectangle
+  style: { fill: "#1d4ed8"; stroke: "#60a5fa"; font-color: "#f9fafb"; border-radius: 6; font-size: 12; bold: true }
+}
+
+# ── Data stores ───────────────────────────────────────────────────────────────
+
+kendra: "Amazon Kendra\nRAG — HashiCorp product docs" {
+  width: 380
+  shape: cylinder
+  style: { fill: "#047857"; stroke: "#34d399"; font-color: "#f9fafb"; font-size: 13; bold: true }
+}
+
+neptune: "Amazon Neptune\nGraph DB — Terraform plan DAG" {
+  width: 380
+  shape: cylinder
+  style: { fill: "#047857"; stroke: "#34d399"; font-color: "#f9fafb"; font-size: 13; bold: true }
+}
+
+# ── Ingest pipelines ──────────────────────────────────────────────────────────
+
+ingest_docs: "Doc Ingestion\nCodeBuild → S3 → Kendra sync" {
+  width: 240
+  shape: rectangle
+  style: { fill: "#3730a3"; stroke: "#818cf8"; font-color: "#f9fafb"; border-radius: 4; font-size: 12; bold: true }
+}
+
+ingest_tf: "Terraform Plan Ingest\nterraform plan → rover → Neptune" {
+  width: 240
+  shape: rectangle
+  style: { fill: "#3730a3"; stroke: "#818cf8"; font-color: "#f9fafb"; border-radius: 4; font-size: 12; bold: true }
+}
+
+# ── External sources ──────────────────────────────────────────────────────────
+
+hashicorp_docs: "HashiCorp Docs\n(GitHub repos + feeds)" {
+  width: 220
+  shape: rectangle
+  style: { fill: "#b91c1c"; stroke: "#f87171"; font-color: "#f9fafb"; border-radius: 4; font-size: 12; bold: true }
+}
+
+tf_configs: "Terraform Configs\n(workspace repos)" {
+  width: 220
+  shape: rectangle
+  style: { fill: "#b91c1c"; stroke: "#f87171"; font-color: "#f9fafb"; border-radius: 4; font-size: 12; bold: true }
+}
+
+# ── Query request path ────────────────────────────────────────────────────────
+
+claude_code -> mcp_server: "" {
+  style: { stroke: "#fbbf24"; stroke-width: 2 }
+}
+bedrock_agent -> mcp_server: "" {
+  style: { stroke: "#fbbf24"; stroke-width: 2 }
+}
+ci_pipeline -> mcp_server: "" {
+  style: { stroke: "#fbbf24"; stroke-width: 2 }
+}
+
+mcp_server -> router: "route query" {
+  style: { stroke: "#a78bfa"; font-color: "#a78bfa"; font-size: 11; stroke-width: 2 }
+}
+
+router -> kendra: "semantic search" {
+  style: { stroke: "#60a5fa"; font-color: "#60a5fa"; font-size: 11 }
+}
+router -> neptune: "graph traversal" {
+  style: { stroke: "#60a5fa"; font-color: "#60a5fa"; font-size: 11 }
+}
+
+# ── Query response path (dashed — flows back up) ──────────────────────────────
+
+kendra -> merger: "ranked passages" {
+  style: { stroke: "#34d399"; font-color: "#34d399"; font-size: 11; stroke-dash: 4 }
+}
+neptune -> merger: "graph results" {
+  style: { stroke: "#34d399"; font-color: "#34d399"; font-size: 11; stroke-dash: 4 }
+}
+
+merger -> mcp_server: "unified context" {
+  style: { stroke: "#a78bfa"; font-color: "#a78bfa"; font-size: 11; stroke-dash: 4; stroke-width: 2 }
+}
+
+# ── Ingest path ───────────────────────────────────────────────────────────────
+
+hashicorp_docs -> ingest_docs: "" {
+  style: { stroke: "#f87171"; stroke-width: 2 }
+}
+ingest_docs -> kendra: "index" {
+  style: { stroke: "#818cf8"; font-color: "#818cf8"; font-size: 11; stroke-width: 2 }
+}
+
+tf_configs -> ingest_tf: "" {
+  style: { stroke: "#f87171"; stroke-width: 2 }
+}
+ingest_tf -> neptune: "load graph" {
+  style: { stroke: "#818cf8"; font-color: "#818cf8"; font-size: 11; stroke-width: 2 }
+}
+
+# ── Legend ────────────────────────────────────────────────────────────────────
+
+legend: {
+  near: bottom-center
+  style: {
+    fill: "#111111"
+    stroke: "#374151"
+    border-radius: 6
+    font-color: "#f9fafb"
+    font-size: 12
+    bold: true
+  }
+
+  consumer: "Consumer" {
+    shape: rectangle
+    style: { fill: "#f59e0b"; stroke: "#fcd34d"; font-color: "#ffffff"; font-size: 11 }
+  }
+  query_hub: "MCP Server (hub)" {
+    shape: rectangle
+    style: { fill: "#7c3aed"; stroke: "#a78bfa"; font-color: "#f9fafb"; font-size: 11 }
+  }
+  query_engine: "Query engine" {
+    shape: rectangle
+    style: { fill: "#1d4ed8"; stroke: "#60a5fa"; font-color: "#f9fafb"; font-size: 11 }
+  }
+  store: "Data store" {
+    shape: cylinder
+    style: { fill: "#047857"; stroke: "#34d399"; font-color: "#f9fafb"; font-size: 11 }
+  }
+  ingest: "Ingest pipeline" {
+    shape: rectangle
+    style: { fill: "#3730a3"; stroke: "#818cf8"; font-color: "#f9fafb"; font-size: 11 }
+  }
+  source: "External source" {
+    shape: rectangle
+    style: { fill: "#b91c1c"; stroke: "#f87171"; font-color: "#f9fafb"; font-size: 11 }
+  }
+}

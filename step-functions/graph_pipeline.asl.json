@@ -1,0 +1,106 @@
+{
+  "Comment": "Terraform graph pipeline: for each workspace repo — plan, rover extract, ingest into Neptune",
+  "StartAt": "Init",
+  "States": {
+    "Init": {
+      "Type": "Pass",
+      "Parameters": {
+        "repo_uris.$":            "$.repo_uris",
+        "graph_staging_bucket.$": "$.graph_staging_bucket",
+        "neptune_endpoint.$":     "$.neptune_endpoint",
+        "neptune_port.$":         "$.neptune_port",
+        "region.$":               "$.region"
+      },
+      "Next": "IngestRepos"
+    },
+
+    "IngestRepos": {
+      "Type": "Map",
+      "ItemsPath": "$.repo_uris",
+      "ItemSelector": {
+        "repo_uri.$":             "$$.Map.Item.Value",
+        "graph_staging_bucket.$": "$$.Execution.Input.graph_staging_bucket",
+        "neptune_endpoint.$":     "$$.Execution.Input.neptune_endpoint",
+        "neptune_port.$":         "$$.Execution.Input.neptune_port",
+        "region.$":               "$$.Execution.Input.region"
+      },
+      "MaxConcurrency": 3,
+      "Iterator": {
+        "StartAt": "StartBuild",
+        "States": {
+          "StartBuild": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+            "Parameters": {
+              "ProjectName": "${codebuild_project_name}",
+              "EnvironmentVariablesOverride": [
+                { "Name": "REPO_URI",              "Value.$": "$.repo_uri",             "Type": "PLAINTEXT" },
+                { "Name": "GRAPH_STAGING_BUCKET",  "Value.$": "$.graph_staging_bucket", "Type": "PLAINTEXT" },
+                { "Name": "NEPTUNE_ENDPOINT",      "Value.$": "$.neptune_endpoint",     "Type": "PLAINTEXT" },
+                { "Name": "NEPTUNE_PORT",          "Value.$": "$.neptune_port",         "Type": "PLAINTEXT" },
+                { "Name": "AWS_REGION",            "Value.$": "$.region",              "Type": "PLAINTEXT" }
+              ]
+            },
+            "ResultPath": "$.buildResult",
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 2,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "Next": "BuildFailed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "RepoComplete"
+          },
+
+          "BuildFailed": {
+            "Type": "Fail",
+            "Error": "CodeBuildFailed",
+            "Cause": "Graph pipeline CodeBuild project failed after retries — check CloudWatch Logs."
+          },
+
+          "RepoComplete": {
+            "Type": "Pass",
+            "Parameters": {
+              "repo_uri.$":    "$.repo_uri",
+              "build_id.$":   "$.buildResult.Build.Id",
+              "status":       "SUCCEEDED"
+            },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.ingestResults",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "PipelineComplete"
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "GraphPipelineFailed",
+      "Cause": "One or more repo ingestion jobs failed — check CloudWatch Logs for details."
+    },
+
+    "PipelineComplete": {
+      "Type": "Pass",
+      "Parameters": {
+        "status":          "SUCCEEDED",
+        "ingest_results.$": "$.ingestResults"
+      },
+      "End": true
+    }
+  }
+}

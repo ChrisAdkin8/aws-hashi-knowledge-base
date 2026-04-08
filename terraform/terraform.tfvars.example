@@ -1,14 +1,19 @@
 # Copy this file to terraform.tfvars and fill in your values.
 # terraform.tfvars is gitignored — never commit it.
 
-region              = "us-west-2"
-repo_uri            = "https://github.com/your-org/hashicorp-bedrock-ai-rag"
-notification_email  = ""        # Set to receive CloudWatch alarm emails
+region   = "us-east-1"
+repo_uri = "https://github.com/your-org/aws-hashi-knowledge-base"
 
 # Optional overrides — defaults are safe for most deployments
-# knowledge_base_name = "hashicorp-knowledge-base"
-# collection_name     = "hashicorp-rag-vectors"
-# refresh_schedule    = "cron(0 2 ? * SUN *)"
-# scheduler_timezone  = "Europe/London"
-# chunk_size          = 1024
-# chunk_overlap_pct   = 20
+# kendra_edition     = "ENTERPRISE_EDITION"   # or DEVELOPER_EDITION (~$810/mo)
+# notification_email = ""                      # Set to receive CloudWatch alarm emails
+# refresh_schedule   = "cron(0 2 ? * SUN *)"  # UTC
+# scheduler_timezone = "Europe/London"
+# force_destroy      = false                   # Set true only for non-production
+
+# Neptune graph database (disabled by default)
+# create_neptune          = false
+# neptune_vpc_id          = "vpc-0123456789abcdef0"
+# neptune_subnet_ids      = ["subnet-aaa", "subnet-bbb"]
+# neptune_instance_class  = "db.r6g.large"
+# neptune_instance_count  = 1
