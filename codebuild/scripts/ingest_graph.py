@@ -22,9 +22,11 @@ import argparse
 import re
 import sys
 import json
+import urllib.parse
 import boto3
 import requests
-from requests_aws4auth import AWS4Auth
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
 
 
 # Matches:   "[root] aws_iam_role.foo (expand)" [label = "aws_iam_role.foo", ...]
@@ -121,26 +123,26 @@ def merge_into_neptune(nodes, edges, endpoint, port, region, iam_auth, repo_uri)
     url = f"https://{endpoint}:{port}/openCypher"
 
     if iam_auth:
-        creds = boto3.Session().get_credentials().get_frozen_credentials()
-        auth = AWS4Auth(
-            creds.access_key,
-            creds.secret_key,
-            region,
-            "neptune-db",
-            session_token=creds.token,
-        )
+        boto_creds = boto3.Session().get_credentials().get_frozen_credentials()
     else:
-        auth = None
+        boto_creds = None
 
     session = requests.Session()
     repo_name = repo_uri.rstrip("/").split("/")[-1].removesuffix(".git")
 
     def run(query, params):
-        resp = session.post(
-            url, auth=auth,
-            data={"query": query, "parameters": json.dumps(params)},
-            timeout=30,
-        )
+        body = urllib.parse.urlencode({
+            "query": query,
+            "parameters": json.dumps(params),
+        })
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+        if boto_creds:
+            aws_req = AWSRequest(method="POST", url=url, data=body, headers=headers)
+            SigV4Auth(boto_creds, "neptune-db", region).add_auth(aws_req)
+            headers = dict(aws_req.headers)
+
+        resp = session.post(url, data=body, headers=headers, timeout=30)
         if not resp.ok:
             print(f"Neptune {resp.status_code} error: {resp.text[:500]}", file=sys.stderr)
         resp.raise_for_status()
