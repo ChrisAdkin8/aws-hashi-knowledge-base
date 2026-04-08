@@ -1,6 +1,11 @@
-# HashiCorp Kendra RAG Pipeline
+# HashiCorp RAG + Graph Pipeline
 
-A production-grade Terraform repository that provisions and operates a Retrieval-Augmented Generation (RAG) system on Amazon Web Services. The system ingests HashiCorp's public documentation from GitHub repositories, GitHub Issues, Discourse forums, and blog posts into **Amazon Kendra**, and surfaces that content through **Amazon Bedrock** (Claude) via an MCP server or programmatic API. The index is kept current via automated weekly refresh.
+A production-grade Terraform repository that provisions and operates two complementary data pipelines on AWS:
+
+1. **HashiCorp Docs Pipeline** — ingests HashiCorp product documentation, forum threads, blog posts, and GitHub issues into **Amazon Kendra** for NLP-powered retrieval.
+2. **Terraform Graph Store** — runs `terraform plan` over your Terraform workspaces, extracts the resource dependency graph via [rover](https://github.com/im2nguyen/rover), and loads it into **Amazon Neptune** (optional).
+
+Both pipelines are surfaced to AI coding assistants through a unified **MCP server** layer.
 
 Clone it, set a few variables, and run `task up` — a single command provisions all infrastructure and ingests the documentation.
 
@@ -8,87 +13,70 @@ Clone it, set a few variables, and run `task up` — a single command provisions
 
 ## Architecture
 
-The pipeline has three layers:
-
-**Ingestion** — AWS CodeBuild clones HashiCorp repos, scrapes APIs, splits and enriches markdown, and uploads to S3.
-
-**Indexing** — Amazon Kendra indexes the S3 documents using its built-in NLP-powered retrieval (no embedding model or vector database required).
-
-**Retrieval** — Claude (via Amazon Bedrock) calls the Kendra index through an MCP server, receiving semantically ranked passages as grounding context.
-
 ```
-EventBridge Scheduler (weekly cron)
-    │
+EventBridge Schedulers (weekly cron)
+    │                          │
+    ▼                          ▼
+Docs Pipeline              Graph Pipeline
+(Step Functions)           (Step Functions)
+    │                          │
+    ▼                          ▼
+CodeBuild                  CodeBuild (per repo)
+(ingest scripts)           terraform plan → rover → ingest_graph.py
+    │                          │
+    ▼                          ▼
+S3 (RAG docs)              Amazon Neptune
+    │                      (property graph)
     ▼
-Step Functions: Init → StartBuild → StartSync → WaitForSync → ValidateRetrieval → PipelineComplete
-                           │                │
-                     CodeBuild          Kendra data source sync
-                     (S3 upload)        (indexes new/changed docs)
+Amazon Kendra
+(NLP index)
+    │                          │
+    └──────────┬───────────────┘
+               ▼
+         MCP Server
+    (unified query layer)
+               │
+               ▼
+         Claude Code
 ```
 
-### Ingestion Pipeline
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed component tables, data flow, IAM design, and state machine internals.
 
-The CodeBuild job runs two parallel tracks:
+See [docs/diagrams/unified-data-layer.svg](docs/diagrams/unified-data-layer.svg) for the unified data layer diagram.
 
-- **Git clone track** — shallow-clones `hashicorp/web-unified-docs` (the authoritative source for Vault, Consul, Nomad, Terraform Enterprise, and HCP Terraform docs) plus Terraform, Packer, Boundary, Waypoint, and all Terraform provider repos. Splits markdown at `##`/`###` heading boundaries, enriches with compact attribution prefixes, and writes cleaned files to `/codebuild/output/cleaned/`.
-- **API fetch track** — queries the GitHub Issues API, HashiCorp Discuss, and HashiCorp/Engineering blogs in parallel; filters and formats results as markdown.
+---
 
-Both tracks converge at a single `aws s3 sync` upload, after which Step Functions triggers a Kendra data source sync job to index all new and changed documents.
+## Terraform Modules
 
-The pipeline supports targeted runs via the `TARGET` parameter, allowing individual content sources to be refreshed without re-ingesting everything:
+| Module | Path | Purpose |
+|---|---|---|
+| **hashicorp-docs-pipeline** | `terraform/modules/hashicorp-docs-pipeline` | S3 bucket, Kendra index + data source, CodeBuild project, Step Functions state machine, EventBridge scheduler, IAM roles |
+| **terraform-graph-store** | `terraform/modules/terraform-graph-store` | Neptune cluster, graph staging S3 bucket, CodeBuild (with VPC config), Step Functions state machine, EventBridge scheduler, IAM roles |
+| **state-backend** | `terraform/modules/state-backend` | KMS-encrypted S3 bucket for Terraform remote state |
 
-| Target | What runs |
-|---|---|
-| `all` (default) | Full pipeline — docs, registry modules, discuss, blogs, GitHub issues |
-| `docs` | Product documentation from HashiCorp repos only |
-| `registry` | Terraform public registry modules only |
-| `discuss` | HashiCorp Discuss threads only |
-| `blogs` | HashiCorp blog posts only |
+The `terraform-graph-store` module is opt-in — set `create_neptune = true` and supply VPC/subnet IDs to enable it.
 
-```bash
-task pipeline:run TARGET=blogs     # refresh blogs only
-task pipeline:run TARGET=discuss   # refresh Discuss threads only
-task pipeline:run                  # full run (default)
-```
-
-> **CDKTF excluded** — CDKTF (CDK for Terraform) documentation is intentionally excluded from the index. Path-based exclusion in `process_docs.py` drops any file under a `cdktf/` or `terraform-cdk/` directory, and title/keyword filters in the blog, discuss, and issues fetch scripts skip CDKTF-primary content.
+Bootstrap (`terraform/bootstrap/`) is a separate root module with a local backend that creates the remote state bucket before the main module runs.
 
 ---
 
 ## Data Sources
 
-The pipeline ingests content from seven source types across three collection methods:
+### Docs Pipeline (Kendra)
 
-### Git-cloned sources
-
-| Source | `source_type` | Repos | What's ingested |
-|---|---|---|---|
-| **HashiCorp core products** | `documentation` | web-unified-docs (vault, consul, nomad, terraform-enterprise, hcp-terraform), terraform, terraform-website, packer, boundary, waypoint | Official product docs — `content/{product}/` from web-unified-docs; `website/` from individual repos |
-| **Terraform providers** | `provider` | AWS, Azure, GCP, Kubernetes, Helm, Docker, Vault, Consul, Nomad, and more | Resource and data source reference docs |
-| **Terraform Registry modules** | `module` | Dynamically discovered via Registry API | Docs from HashiCorp-verified modules |
-| **Sentinel policy libraries** | `sentinel` | 4 repos | Policy definitions and usage documentation |
-
-### API-fetched sources
-
-| Source | `source_type` | What's ingested |
+| Source | Collection method | What's ingested |
 |---|---|---|
-| **GitHub Issues** | `issue` | Issues from the last 365 days across 8 priority repos. Filtered: PRs excluded, minimum body length, minimum comment count, label denylist. |
-| **HashiCorp Discuss** | `discuss` | Forum threads with at least 1 reply from the last 365 days across 9 product categories. Accepted answers reordered to front. |
-| **HashiCorp Blog** | `blog` | Posts from the last 365 days from hashicorp.com/blog and medium.com/hashicorp-engineering. Content read from inline feed tags (`<content>` / `<content:encoded>`) — article URLs are Cloudflare-protected and cannot be scraped. |
+| **HashiCorp core products** | Git clone | `hashicorp/web-unified-docs` (Vault, Consul, Nomad, TFE, HCP Terraform), Terraform, Packer, Boundary, Waypoint |
+| **Terraform providers** | Git clone | AWS, Azure, GCP, Kubernetes, Helm, Docker, Vault, Consul, Nomad, and more |
+| **Terraform Registry modules** | Registry API + git clone | HashiCorp-verified module docs |
+| **Sentinel policy libraries** | Git clone | Policy definitions and usage docs |
+| **GitHub Issues** | GitHub API | Last 365 days, 8 priority repos |
+| **HashiCorp Discuss** | Discourse API | Last 365 days, 9 product categories |
+| **HashiCorp Blog** | RSS/Atom feed (inline content) | Last 365 days |
 
-### Document metadata
+### Graph Pipeline (Neptune)
 
-Every document begins with a compact attribution prefix (~15 tokens vs ~100 tokens for YAML front matter):
-
-```
-[provider:aws] aws_instance — Argument Reference
-
-[discuss:terraform] How do I manage multiple workspaces?
-
-[issue:vault] #1234 (closed): Dynamic secrets not rotating
-```
-
-Kendra custom metadata attributes (`product`, `product_family`, `source_type`) are written in `.metadata.json` sidecar files alongside each document. These attributes are used at query time to filter results by product or source type.
+The graph pipeline runs `terraform plan -out=tfplan` in each workspace repo, extracts the resource dependency graph using rover, and loads nodes and edges into Neptune via openCypher queries. This gives AI assistants a queryable model of real infrastructure topology.
 
 ---
 
@@ -96,13 +84,14 @@ Kendra custom metadata attributes (`product`, `product_family`, `source_type`) a
 
 - **AWS account** with billing enabled
 - **AWS CLI** installed and credentials configured — environment variables, `aws configure`, or AWS SSO
-- **Terraform** >= 1.5
+- **Terraform** >= 1.10
 - **Python** 3.11+
 - **Task** ([taskfile.dev](https://taskfile.dev)) — `brew install go-task`
-- **Python packages** — `pip install boto3 pyyaml requests pytest beautifulsoup4`
+- **Python packages** — `pip install boto3 pyyaml requests pytest beautifulsoup4 mcp`
 - **shellcheck** — `brew install shellcheck`
 - **jq** — `brew install jq`
 - **Amazon Bedrock model access** — enable Claude (e.g. `claude-sonnet-4-20250514`) in Bedrock console → Model access for AI inference via the MCP server
+- *(Neptune only)* An existing VPC with private subnets where CodeBuild can reach Neptune on port 8182
 
 ---
 
@@ -111,22 +100,18 @@ Kendra custom metadata attributes (`product`, `product_family`, `source_type`) a
 1. **Clone the repository**
 
    ```bash
-   git clone https://github.com/ChrisAdkin8/hashicorp-bedrock-ai-rag
-   cd hashicorp-bedrock-ai-rag
+   git clone https://github.com/ChrisAdkin8/aws-hashi-knowledge-base
+   cd aws-hashi-knowledge-base
    ```
 
 2. **Configure AWS credentials**
 
    ```bash
-   # Environment variables (preferred for temporary/CI sessions)
    export AWS_ACCESS_KEY_ID=AKIA...
    export AWS_SECRET_ACCESS_KEY=...
    export AWS_SESSION_TOKEN=...   # required for temporary credentials
 
-   # Named profile
-   aws configure
-
-   # AWS SSO
+   # or use a named profile / AWS SSO
    aws sso login --profile my-profile
    ```
 
@@ -139,17 +124,10 @@ Kendra custom metadata attributes (`product`, `product_family`, `source_type`) a
    .venv/bin/pip install boto3 pyyaml requests pytest beautifulsoup4 mcp
    ```
 
-4. **Deploy everything with one command**
+4. **Deploy**
 
    ```bash
-   task up REPO_URI=https://github.com/ChrisAdkin8/hashicorp-bedrock-ai-rag
-   ```
-
-   Optional overrides:
-
-   ```bash
-   task up REPO_URI=https://github.com/ChrisAdkin8/hashicorp-bedrock-ai-rag REGION=eu-west-1
-   task up REPO_URI=https://github.com/ChrisAdkin8/hashicorp-bedrock-ai-rag SKIP_PIPELINE=true
+   task up REPO_URI=https://github.com/ChrisAdkin8/aws-hashi-knowledge-base
    ```
 
    `task up` runs these steps automatically:
@@ -157,11 +135,18 @@ Kendra custom metadata attributes (`product`, `product_family`, `source_type`) a
    | Step | What happens |
    |---|---|
    | 0 | Preflight checks — tools, auth, Python packages, repo files, Terraform formatting |
-   | 1 | S3 state bucket + DynamoDB lock table created (idempotent) |
-   | 2 | All AWS infrastructure provisioned via `terraform apply` — IAM, S3, Kendra, CodeBuild, Step Functions, EventBridge |
-   | 3 | First pipeline run triggered — CodeBuild ingests docs to S3, Kendra syncs and indexes |
+   | 1 | Bootstrap: create remote state S3 bucket (`terraform/bootstrap`) |
+   | 2 | All AWS infrastructure provisioned via `terraform apply` — IAM, S3, Kendra, CodeBuild, Step Functions, EventBridge, Neptune (if `create_neptune=true`) |
+   | 3 | First docs pipeline run triggered — CodeBuild ingests docs to S3, Kendra syncs and indexes |
 
-   > **Note:** Kendra index creation takes 10–30 minutes on first deploy. The pipeline run starts automatically once Terraform completes.
+   Optional overrides:
+
+   ```bash
+   task up REPO_URI=https://github.com/... REGION=eu-west-1
+   task up REPO_URI=https://github.com/... SKIP_PIPELINE=true
+   ```
+
+   > **Note:** Kendra index creation takes 10–30 minutes on first deploy.
 
 5. **Validate retrieval quality**
 
@@ -169,30 +154,47 @@ Kendra custom metadata attributes (`product`, `product_family`, `source_type`) a
    task pipeline:test KENDRA_INDEX_ID=<INDEX_ID>
    ```
 
-6. **Measure token efficiency** (optional)
-
-   Compares RAG retrieval token cost against pasting full documentation pages.
-   `KENDRA_INDEX_ID` and `REGION` are auto-detected from Terraform output when not provided.
+6. *(Optional)* **Populate the graph database**
 
    ```bash
-   task pipeline:token-efficiency
-   # or explicitly:
-   task pipeline:token-efficiency KENDRA_INDEX_ID=<INDEX_ID> REGION=us-east-1
+   task graph:populate GRAPH_REPO_URIS='["https://github.com/org/infra-repo"]'
    ```
-
-   Install `tiktoken` for exact token counts: `pip install tiktoken`
 
 ---
 
 ## Configuration
 
+### Docs Pipeline
+
 | Variable | Default | Description |
 |---|---|---|
-| `region` | `us-west-2` | AWS region for all resources |
+| `region` | `us-east-1` | AWS region for all resources |
 | `repo_uri` | (required) | GitHub HTTPS URL of this repo — CodeBuild clones it to run pipeline scripts |
-| `kendra_edition` | `ENTERPRISE_EDITION` | `DEVELOPER_EDITION` (10 k doc limit, ~$810/mo) or `ENTERPRISE_EDITION` (~$1,400/mo, 100 k docs per SCU). Cannot be changed in-place; requires destroy + recreate. |
-| `refresh_schedule` | `cron(0 2 ? * SUN *)` | EventBridge cron expression (UTC) |
+| `kendra_edition` | `ENTERPRISE_EDITION` | `DEVELOPER_EDITION` (~$810/mo, 10k docs) or `ENTERPRISE_EDITION` (~$1,400/mo, 100k docs/SCU). Cannot change in-place. |
+| `refresh_schedule` | `cron(0 2 ? * SUN *)` | EventBridge cron expression (UTC) for the docs pipeline |
+| `scheduler_timezone` | `Europe/London` | Timezone for the EventBridge Scheduler |
 | `notification_email` | `""` | Email for CloudWatch alarms (empty = disabled) |
+| `create_github_oidc_provider` | `false` | Create GitHub Actions OIDC provider + IAM role for CI/CD |
+| `force_destroy` | `false` | Allow S3 bucket destruction even if non-empty (non-prod only) |
+| `tags` | `{}` | Additional tags applied to all resources |
+
+### Graph Pipeline (Neptune)
+
+| Variable | Default | Description |
+|---|---|---|
+| `create_neptune` | `false` | Set `true` to deploy the Neptune module |
+| `neptune_vpc_id` | `""` | VPC ID for the Neptune cluster |
+| `neptune_subnet_ids` | `[]` | Subnet IDs for the Neptune subnet group |
+| `neptune_allowed_cidr_blocks` | `[]` | CIDR blocks permitted to reach Neptune on port 8182 |
+| `neptune_cluster_identifier` | `hashicorp-rag-graph` | Neptune cluster identifier |
+| `neptune_instance_class` | `db.r6g.large` | Neptune instance class |
+| `neptune_instance_count` | `1` | Number of Neptune instances (1 = writer only) |
+| `neptune_iam_auth_enabled` | `true` | Enable IAM authentication for Neptune |
+| `neptune_deletion_protection` | `false` | Prevent cluster deletion via Terraform |
+| `neptune_backup_retention_days` | `7` | Automated backup retention (days) |
+| `graph_repo_uris` | `[]` | GitHub HTTPS URLs of Terraform workspace repos to ingest into Neptune |
+| `graph_refresh_schedule` | `cron(0 3 ? * SUN *)` | EventBridge cron for the graph pipeline (UTC) |
+| `graph_codebuild_compute_type` | `BUILD_GENERAL1_MEDIUM` | CodeBuild compute type for graph pipeline |
 
 ---
 
@@ -200,7 +202,7 @@ Kendra custom metadata attributes (`product`, `product_family`, `source_type`) a
 
 ### Claude Code via MCP Server
 
-The MCP server in `mcp/server.py` exposes the Kendra index as tools that Claude Code calls automatically when answering questions about HashiCorp products.
+The MCP server in `mcp/server.py` exposes the Kendra index as tools that Claude Code calls automatically.
 
 ```bash
 task mcp:install                                    # install mcp + boto3 into .venv
@@ -218,12 +220,23 @@ Available tools:
 Route Claude Code through your AWS account's Bedrock endpoint:
 
 ```bash
-task claude:setup                              # default (us-west-2, claude-sonnet-4-20250514)
+task claude:setup                              # default (us-east-1, claude-sonnet-4-20250514)
 task claude:setup CLAUDE_REGION=eu-west-2
 task claude:setup PERSIST=true                 # persist to ~/.bashrc
 ```
 
-### Programmatic access (retrieve-then-prompt)
+### Targeted pipeline runs
+
+```bash
+task pipeline:run TARGET=blogs     # refresh blogs only
+task pipeline:run TARGET=discuss   # refresh Discuss threads only
+task pipeline:run TARGET=docs      # product repo documentation only
+task pipeline:run                  # full run (default)
+```
+
+Valid `TARGET` values: `all` (default), `docs`, `registry`, `discuss`, `blogs`.
+
+### Programmatic access
 
 ```python
 import boto3
@@ -255,14 +268,38 @@ print(response["output"]["message"]["content"][0]["text"])
 
 ---
 
+## Task Reference
+
+| Task | Description |
+|---|---|
+| `task up` | Full deploy: preflight → bootstrap → terraform apply → first pipeline run |
+| `task down` | Destroy all Terraform-managed infrastructure |
+| `task login` | Verify AWS credentials |
+| `task bootstrap` | Create/verify remote state S3 bucket |
+| `task plan` | `terraform plan` |
+| `task apply` | `terraform apply -auto-approve` |
+| `task pipeline:run` | Trigger a docs pipeline run and wait for completion |
+| `task pipeline:test` | Run retrieval validation queries against Kendra |
+| `task pipeline:status` | List last 5 docs pipeline executions |
+| `task pipeline:token-efficiency` | Compare RAG token cost vs full-page paste |
+| `task graph:populate` | Trigger a graph pipeline run and wait for completion |
+| `task graph:status` | List last 5 graph pipeline executions |
+| `task mcp:install` | Install MCP server dependencies |
+| `task mcp:setup` | Register MCP server with Claude Code |
+| `task mcp:test` | Smoke-test MCP server connectivity |
+| `task claude:setup` | Configure Claude Code to use Amazon Bedrock |
+
+---
+
 ## Costs
 
 | Component | Notes |
 |---|---|
 | **Amazon Kendra Enterprise Edition** | ~$1,400/month flat + $35/SCU/month for additional storage. Includes 10,000 queries/day. |
 | **Amazon Kendra Developer Edition** | ~$810/month, 10,000 document limit. Suitable for evaluation only. |
+| **Amazon Neptune** | ~$0.20–$0.35/hour per instance (`db.r6g.large`). Optional — only deployed when `create_neptune = true`. |
 | **Amazon Bedrock** | Pay-per-token for Claude inference; negligible for query-time use |
-| **S3** | Storage for processed markdown (~GB range); negligible cost |
+| **S3** | Storage for processed markdown and graph staging; negligible cost |
 | **CodeBuild** | Per-build-minute (`BUILD_GENERAL1_MEDIUM`); ~weekly runs |
 | **Step Functions** | Per-state-transition; negligible for weekly runs |
 | **EventBridge Scheduler** | Negligible |
@@ -275,11 +312,12 @@ print(response["output"]["message"]["content"][0]["text"])
 
 See [docs/RUNBOOK.md](docs/RUNBOOK.md) for the full operational runbook.
 
-Quick links (replace `REGION`):
+Quick links (replace `REGION` with your deployment region, default `us-east-1`):
 
 - Step Functions: `https://console.aws.amazon.com/states/home?region=REGION`
 - CodeBuild: `https://console.aws.amazon.com/codesuite/codebuild/projects?region=REGION`
 - Kendra: `https://console.aws.amazon.com/kendra/home?region=REGION`
+- Neptune: `https://console.aws.amazon.com/neptune/home?region=REGION`
 - CloudWatch Logs (CodeBuild): `https://console.aws.amazon.com/cloudwatch/home?region=REGION#logsV2:log-groups/log-group/$252Faws$252Fcodebuild$252Frag-hashicorp-pipeline`
 
 ---

@@ -1,21 +1,18 @@
 version: "3"
 
-# Requires: Task (https://taskfile.dev), terraform, awscli, python3
+# HashiCorp RAG + Graph Pipeline — Task runner
 #
-# Quick start — provision everything with one command:
-#
+# Quick start (provision everything):
 #   task up REPO_URI=https://github.com/org/repo
 #
-# REGION defaults to us-west-2. Override with REGION=us-east-1 if needed.
+# REGION defaults to us-east-1. Override with REGION=us-west-2 if needed.
 #
-# State and RAG bucket names are derived automatically:
-#   <ACCOUNT_ID>-tf-state-<8-char hash>
-#   hashicorp-rag-docs-<8-char hash>
+# State bucket name is deterministic: <ACCOUNT_ID>-tf-state-<8-char hash>
 
 vars:
   TF_DIR: terraform
   PYTHON: .venv/bin/python3
-  REGION: '{{.REGION | default "us-west-2"}}'
+  REGION: '{{.REGION | default "us-east-1"}}'
   ACCOUNT_ID:
     sh: 'aws sts get-caller-identity --query Account --output text 2>/dev/null || echo ""'
   STATE_BUCKET:
@@ -28,48 +25,44 @@ tasks:
     cmds:
       - task --list
 
-  # ── Authentication ─────────────────────────────────────────────────────────
+  # ── Authentication ──────────────────────────────────────────────────────────
 
   login:
     desc: "Verify AWS credentials and print caller identity"
     summary: |
-      Checks that valid AWS credentials are available (env vars, ~/.aws/credentials,
-      instance profile, or AWS SSO). Prints the current identity.
+      Checks that valid AWS credentials are configured. Prints the caller identity.
 
-      For AWS SSO:
-        aws sso login --profile my-profile
-      For IAM keys:
-        aws configure
+      For AWS SSO:   aws sso login --profile my-profile
+      For IAM keys:  aws configure
 
       Example:
         task login
     cmds:
       - aws sts get-caller-identity
-      - echo "AWS region set to {{.REGION}}"
+      - echo "Region: {{.REGION}}"
 
-  # ── Primary entrypoint ─────────────────────────────────────────────────────
+  # ── Primary entrypoint ──────────────────────────────────────────────────────
 
   up:
     desc: "Full end-to-end deploy: preflight → bootstrap → apply → pipeline"
     summary: |
-      Provisions the complete Kendra RAG pipeline in a single command.
-      Idempotent — safe to re-run. Each step is skipped automatically if
-      already complete.
+      Provisions all infrastructure and triggers the first docs ingestion run.
+      Idempotent — safe to re-run.
 
       Steps:
         0. Preflight checks (tools, auth, Python packages, files, Terraform)
-        1. Create S3 state bucket (bootstrap_state.sh)
-        2. terraform apply — provisions all infra including Kendra index + data source
-        3. Trigger first pipeline run and wait
+        1. Bootstrap — create S3 state bucket via terraform/bootstrap
+        2. terraform apply — IAM, S3, Kendra, CodeBuild, Step Functions, EventBridge
+        3. First docs pipeline run (skip with SKIP_PIPELINE=true)
 
-      Note: Kendra index creation takes 10-30 minutes.
+      Note: Kendra index creation takes 10–30 minutes on first deploy.
 
-      Required vars: REPO_URI
-      Optional vars: REGION, SKIP_PIPELINE=true
+      Required: REPO_URI
+      Optional: REGION, SKIP_PIPELINE=true
 
       Example:
         task up REPO_URI=https://github.com/org/repo
-        task up REPO_URI=https://github.com/org/repo REGION=us-east-1 SKIP_PIPELINE=true
+        task up REPO_URI=https://github.com/org/repo REGION=eu-west-1 SKIP_PIPELINE=true
     requires:
       vars: [REPO_URI]
     cmds:
@@ -80,36 +73,33 @@ tasks:
           --repo-uri {{.REPO_URI}} \
           {{if eq .SKIP_PIPELINE "true"}}--skip-pipeline{{end}}
 
-  # ── Bootstrap (one-time, also called by `up`) ──────────────────────────────
+  # ── Bootstrap ───────────────────────────────────────────────────────────────
 
   bootstrap:
-    desc: "One-time: create S3 state bucket and DynamoDB lock table"
+    desc: "Create the S3 state bucket via terraform/bootstrap (one-time, idempotent)"
     summary: |
-      Creates the S3 bucket used for Terraform state and the DynamoDB table
-      used for state locking. Called automatically by `task up`.
+      Applies the terraform/bootstrap root module which creates the S3 bucket
+      used for Terraform remote state. Uses a local backend so it can run before
+      the main module is initialised. Safe to re-run — bucket creation is idempotent.
 
-      The bucket name is derived: <ACCOUNT_ID>-tf-state-<8-char hash>
-      The table name is: terraform-state-lock
+      Called automatically by `task up` via scripts/deploy.sh.
 
       Example:
         task bootstrap
+        task bootstrap REGION=eu-west-1
     cmds:
-      - scripts/bootstrap_state.sh --region {{.REGION}}
+      - terraform -chdir={{.TF_DIR}}/bootstrap init -input=false
+      - terraform -chdir={{.TF_DIR}}/bootstrap apply -auto-approve -var="region={{.REGION}}"
+      - echo "State bucket: $(terraform -chdir={{.TF_DIR}}/bootstrap output -raw bucket_name)"
 
-  # ── OIDC provider ──────────────────────────────────────────────────────────
+  # ── OIDC provider ───────────────────────────────────────────────────────────
 
   oidc:import:
-    desc: "Import the GitHub Actions OIDC provider into Terraform state if it already exists in AWS"
+    desc: "Import the GitHub Actions OIDC provider into Terraform state if it already exists"
     summary: |
-      Checks whether the GitHub Actions OIDC provider already exists in the AWS
-      account. If it does and is not yet tracked in Terraform state, imports it
-      so that a subsequent 'terraform apply' does not attempt to create a
-      duplicate (which would fail with EntityAlreadyExists).
-
-      Safe to run on every deploy — exits cleanly if the provider is already in
-      state or does not yet exist.
-
-      Called automatically by 'task up'.
+      If the GitHub OIDC provider already exists in the AWS account but is not
+      yet tracked in Terraform state, imports it to prevent a duplicate-creation
+      error on the next apply. Safe to run on every deploy.
 
       Example:
         task oidc:import
@@ -124,15 +114,16 @@ tasks:
           exit 0
         fi
         echo "OIDC: found existing provider {{.OIDC_ARN}}"
-        if terraform -chdir={{.TF_DIR}} state show aws_iam_openid_connect_provider.github &>/dev/null; then
+        STATE_ADDR="module.hashicorp_docs_pipeline.aws_iam_openid_connect_provider.github[0]"
+        if terraform -chdir={{.TF_DIR}} state show "${STATE_ADDR}" &>/dev/null; then
           echo "OIDC: already in Terraform state — nothing to do."
         else
           echo "OIDC: importing into Terraform state..."
-          terraform -chdir={{.TF_DIR}} import aws_iam_openid_connect_provider.github "{{.OIDC_ARN}}"
+          terraform -chdir={{.TF_DIR}} import "${STATE_ADDR}" "{{.OIDC_ARN}}"
           echo "OIDC: import complete."
         fi
 
-  # ── Terraform core ─────────────────────────────────────────────────────────
+  # ── Terraform ───────────────────────────────────────────────────────────────
 
   fmt:
     desc: "Format all Terraform files in-place"
@@ -157,7 +148,7 @@ tasks:
           -input=false
 
   init:upgrade:
-    desc: "Re-initialise and upgrade providers"
+    desc: "Re-initialise Terraform and upgrade providers"
     env:
       AWS_DEFAULT_REGION: '{{.REGION}}'
     cmds:
@@ -168,7 +159,7 @@ tasks:
           -input=false -upgrade
 
   validate:
-    desc: "Run terraform validate (requires init)"
+    desc: "Run terraform validate"
     deps: [init]
     cmds:
       - terraform -chdir={{.TF_DIR}} validate
@@ -198,20 +189,16 @@ tasks:
     cmds:
       - terraform -chdir={{.TF_DIR}} output
 
-  # ── Pipeline operations ────────────────────────────────────────────────────
+  # ── Docs pipeline (Kendra RAG) ──────────────────────────────────────────────
 
   pipeline:run:
-    desc: "Trigger the Step Functions RAG pipeline and wait for completion"
+    desc: "Trigger the docs ingestion pipeline and wait for completion"
     summary: |
-      Starts a Step Functions execution for the RAG pipeline and polls until
-      it completes (SUCCEEDED, FAILED, TIMED_OUT, or ABORTED).
-
-      The state machine ARN, Kendra Index ID, and Data Source ID are
-      auto-detected from Terraform output when not explicitly provided.
+      Starts the Step Functions docs pipeline and polls until it finishes.
 
       TARGET controls which content sources are ingested (default: all):
         all       — full pipeline (docs + registry modules + discuss + blogs + issues)
-        docs      — product documentation from HashiCorp repos only
+        docs      — product documentation only
         registry  — Terraform public registry modules only
         discuss   — HashiCorp Discuss threads only
         blogs     — HashiCorp blog posts only
@@ -219,9 +206,7 @@ tasks:
       Example:
         task pipeline:run
         task pipeline:run TARGET=blogs
-        task pipeline:run TARGET=discuss
-        task pipeline:run TARGET=registry
-        task pipeline:run KENDRA_INDEX_ID=ABCDEFGHIJ KENDRA_DS_ID=KLMNOPQRST TARGET=docs
+        task pipeline:run KENDRA_INDEX_ID=ABCDEFGHIJ KENDRA_DS_ID=KLMNOPQRST
     deps: [init]
     vars:
       TARGET: '{{.TARGET | default "all"}}'
@@ -260,8 +245,8 @@ tasks:
   pipeline:test:
     desc: "Run retrieval quality tests against the Kendra index"
     summary: |
-      Runs 10 test queries against the Kendra index covering all product
-      families and source types. Reports result counts and confidence levels.
+      Runs 10 test queries against the Kendra index and reports result counts
+      and confidence levels across all product families and source types.
 
       Example:
         task pipeline:test KENDRA_INDEX_ID=ABCDEFGHIJ
@@ -274,21 +259,17 @@ tasks:
       - "{{.PYTHON}} scripts/test_retrieval.py --region {{.REGION}} --kendra-index-id {{.KENDRA_INDEX_ID}} --min-confidence {{.MIN_CONFIDENCE}}"
 
   pipeline:token-efficiency:
-    desc: "Compare token efficiency of RAG retrieval vs raw documentation"
+    desc: "Compare RAG retrieval token cost against raw documentation"
     summary: |
-      Runs a suite of cross-product queries and compares token cost of RAG
-      retrieval against the estimated cost of pasting full documentation pages.
+      Runs cross-product queries and compares token cost of RAG retrieval
+      against pasting full documentation pages.
 
-      KENDRA_INDEX_ID and REGION are auto-detected from Terraform output when
-      not provided. REGION defaults to the Taskfile global only as a last resort.
-
-      Optional: install tiktoken for precise token counting:
-        pip install tiktoken
+      KENDRA_INDEX_ID and REGION are auto-detected from Terraform output.
+      Install tiktoken for precise token counts: pip install tiktoken
 
       Example:
         task pipeline:token-efficiency
         task pipeline:token-efficiency KENDRA_INDEX_ID=ABCDEFGHIJ
-        task pipeline:token-efficiency KENDRA_INDEX_ID=ABCDEFGHIJ REGION=us-west-1
     deps: [init]
     vars:
       KENDRA_INDEX_ID:
@@ -307,9 +288,114 @@ tasks:
           echo "Pass it explicitly: task pipeline:token-efficiency KENDRA_INDEX_ID=<id>"
           exit 1
         fi
-        {{.PYTHON}} scripts/test_token_efficiency.py --region {{.EFFECTIVE_REGION}} --kendra-index-id {{.KENDRA_INDEX_ID}}
+        {{.PYTHON}} scripts/test_token_efficiency.py \
+          --region          {{.EFFECTIVE_REGION}} \
+          --kendra-index-id {{.KENDRA_INDEX_ID}}
 
-  # ── Preflight checks ───────────────────────────────────────────────────────
+  # ── Graph pipeline (Neptune) ────────────────────────────────────────────────
+
+  graph:populate:
+    desc: "Trigger the graph pipeline to extract Terraform plans and load into Neptune"
+    summary: |
+      Starts the Step Functions graph pipeline which:
+        1. Clones each Terraform workspace repo
+        2. Runs terraform plan + rover to extract the resource graph
+        3. Loads nodes and edges into Neptune via openCypher MERGE statements
+
+      GRAPH_REPO_URIS is a space-separated list of GitHub HTTPS repo URLs.
+      Auto-detected from terraform.tfvars when not provided.
+
+      Requires create_neptune=true and a deployed graph store.
+
+      Example:
+        task graph:populate GRAPH_REPO_URIS="https://github.com/org/infra-repo"
+        task graph:populate   # uses graph_repo_uris from terraform.tfvars
+    deps: [init]
+    vars:
+      GRAPH_STATE_MACHINE_ARN:
+        sh: 'terraform -chdir={{.TF_DIR}} output -raw graph_state_machine_arn 2>/dev/null || echo ""'
+      NEPTUNE_ENDPOINT:
+        sh: 'terraform -chdir={{.TF_DIR}} output -raw neptune_cluster_endpoint 2>/dev/null || echo ""'
+      NEPTUNE_PORT:
+        sh: 'terraform -chdir={{.TF_DIR}} output -raw neptune_port 2>/dev/null || echo "8182"'
+      GRAPH_STAGING_BUCKET:
+        sh: 'terraform -chdir={{.TF_DIR}} output -raw graph_staging_bucket_name 2>/dev/null || echo ""'
+      REPO_URIS_RAW:
+        sh: >
+          {{if .GRAPH_REPO_URIS}}echo "{{.GRAPH_REPO_URIS}}"{{else}}
+          grep graph_repo_uris {{.TF_DIR}}/terraform.tfvars 2>/dev/null | grep -oP '"[^"]+"' | tr -d '"' | tr '\n' ' ' || echo ""
+          {{end}}
+    cmds:
+      - |
+        if [ -z "{{.GRAPH_STATE_MACHINE_ARN}}" ]; then
+          echo "Error: graph_state_machine_arn not found in Terraform output."
+          echo "Ensure create_neptune=true and run 'task apply' first."
+          exit 1
+        fi
+        if [ -z "{{.REPO_URIS_RAW}}" ]; then
+          echo "Error: No repo URIs found."
+          echo "Pass GRAPH_REPO_URIS or set graph_repo_uris in terraform.tfvars."
+          exit 1
+        fi
+        # Build JSON array from space-separated URIs
+        REPO_JSON=$(echo "{{.REPO_URIS_RAW}}" | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -s .)
+        INPUT=$(jq -n \
+          --argjson repo_uris    "${REPO_JSON}" \
+          --arg     bucket       "{{.GRAPH_STAGING_BUCKET}}" \
+          --arg     endpoint     "{{.NEPTUNE_ENDPOINT}}" \
+          --arg     port         "{{.NEPTUNE_PORT}}" \
+          --arg     region       "{{.REGION}}" \
+          '{repo_uris: $repo_uris, graph_staging_bucket: $bucket, neptune_endpoint: $endpoint, neptune_port: $port, region: $region}')
+        echo "Starting graph pipeline..."
+        echo "Repos: $(echo "${REPO_JSON}" | jq -r '.[]')"
+        EXECUTION_ARN=$(aws stepfunctions start-execution \
+          --state-machine-arn "{{.GRAPH_STATE_MACHINE_ARN}}" \
+          --input             "${INPUT}" \
+          --region            "{{.REGION}}" \
+          --query executionArn --output text)
+        echo "Execution: ${EXECUTION_ARN}"
+        echo "Polling for completion..."
+        while true; do
+          STATUS=$(aws stepfunctions describe-execution \
+            --execution-arn "${EXECUTION_ARN}" \
+            --region        "{{.REGION}}" \
+            --query         status --output text)
+          echo "  Status: ${STATUS}"
+          case "${STATUS}" in
+            SUCCEEDED) echo "Graph pipeline complete."; break ;;
+            FAILED|TIMED_OUT|ABORTED)
+              echo "Graph pipeline ${STATUS}. Check Step Functions console for details."
+              exit 1 ;;
+            *) sleep 30 ;;
+          esac
+        done
+
+  graph:status:
+    desc: "Show the last 5 graph pipeline executions"
+    summary: |
+      Lists recent Step Functions executions for the graph pipeline,
+      showing status and start time.
+
+      Example:
+        task graph:status
+    deps: [init]
+    vars:
+      GRAPH_STATE_MACHINE_ARN:
+        sh: 'terraform -chdir={{.TF_DIR}} output -raw graph_state_machine_arn 2>/dev/null || echo ""'
+    cmds:
+      - |
+        if [ -z "{{.GRAPH_STATE_MACHINE_ARN}}" ]; then
+          echo "No graph state machine found — is create_neptune=true?"
+          exit 0
+        fi
+        aws stepfunctions list-executions \
+          --state-machine-arn "{{.GRAPH_STATE_MACHINE_ARN}}" \
+          --region            "{{.REGION}}" \
+          --max-results       5 \
+          --query "executions[].{Status:status, Started:startDate, Name:name}" \
+          --output table
+
+  # ── Preflight checks ────────────────────────────────────────────────────────
 
   preflight:
     desc: "Run all preflight checks: tools, auth, Python packages, files, Terraform"
@@ -332,104 +418,66 @@ tasks:
             ver=$("$cmd" --version 2>&1 | head -1)
             echo "OK: $cmd — $ver"
           else
-            echo "MISSING: $cmd — install before proceeding"
+            echo "MISSING: $cmd"
             fail=1
           fi
         done
-        if [ "$fail" -ne 0 ]; then
-          echo ""
-          echo "Install missing tools and re-run 'task preflight:tools'."
-          exit 1
-        fi
+        [ "$fail" -ne 0 ] && { echo "Install missing tools and re-run."; exit 1; } || true
       - |
-        # Terraform version gate (>= 1.5)
         tf_ver=$(terraform version -json 2>/dev/null | jq -r '.terraform_version // empty')
-        if [ -z "$tf_ver" ]; then
-          tf_ver=$(terraform version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-        fi
-        major=$(echo "$tf_ver" | cut -d. -f1)
-        minor=$(echo "$tf_ver" | cut -d. -f2)
+        [ -z "$tf_ver" ] && tf_ver=$(terraform version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+        major=$(echo "$tf_ver" | cut -d. -f1); minor=$(echo "$tf_ver" | cut -d. -f2)
         if [ "$major" -ge 2 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 5 ]; }; then
           echo "OK: Terraform $tf_ver (>= 1.5)"
         else
-          echo "FAIL: Terraform $tf_ver — need >= 1.5"
-          exit 1
+          echo "FAIL: Terraform $tf_ver — need >= 1.5"; exit 1
         fi
       - |
-        # Python version gate (>= 3.11)
         py_ver=$({{.PYTHON}} -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-        py_major=$(echo "$py_ver" | cut -d. -f1)
-        py_minor=$(echo "$py_ver" | cut -d. -f2)
+        py_major=$(echo "$py_ver" | cut -d. -f1); py_minor=$(echo "$py_ver" | cut -d. -f2)
         if [ "$py_major" -ge 3 ] && [ "$py_minor" -ge 11 ]; then
           echo "OK: Python $py_ver (>= 3.11)"
         else
-          echo "FAIL: Python $py_ver — need >= 3.11"
-          exit 1
+          echo "FAIL: Python $py_ver — need >= 3.11"; exit 1
         fi
 
   preflight:auth:
     desc: "Check AWS authentication and credentials"
     cmds:
       - |
-        # Report credential source
         if [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
-          echo "OK: AWS_ACCESS_KEY_ID is set (key ID: ${AWS_ACCESS_KEY_ID:0:4}****)"
-          if [ -n "$AWS_SESSION_TOKEN" ]; then
-            echo "OK: AWS_SESSION_TOKEN is set (temporary credentials)"
-          fi
+          echo "OK: AWS_ACCESS_KEY_ID set (${AWS_ACCESS_KEY_ID:0:4}****)"
+          [ -n "$AWS_SESSION_TOKEN" ] && echo "OK: AWS_SESSION_TOKEN set (temporary credentials)"
           cred_source="environment variables"
         elif [ -f "$HOME/.aws/credentials" ] || [ -f "$HOME/.aws/config" ]; then
           cred_source="~/.aws profile"
         else
-          cred_source="unknown (instance profile / IRSA / ECS task role)"
+          cred_source="instance profile / IRSA / ECS task role"
         fi
-        # Verify the credentials actually work
         if aws sts get-caller-identity &>/dev/null; then
           ACCT=$(aws sts get-caller-identity --query Account --output text)
           ARN=$(aws sts get-caller-identity --query Arn --output text)
           echo "OK: Authenticated as ${ARN} (account ${ACCT}) via ${cred_source}"
           echo "OK: AWS region is {{.REGION}}"
         else
-          echo "FAIL: No valid AWS credentials found."
-          echo "  Options:"
-          echo "    export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=..."
-          echo "    aws configure"
-          echo "    aws sso login --profile my-profile"
+          echo "FAIL: No valid AWS credentials."
+          echo "  aws configure | aws sso login --profile my-profile | export AWS_ACCESS_KEY_ID=..."
           exit 1
         fi
 
   preflight:python:
-    desc: "Check Python packages required by scripts"
+    desc: "Check Python packages required by pipeline scripts"
     cmds:
       - |
         fail=0
-        declare -A pkg_imports=(
-          [pyyaml]=yaml
-          [requests]=requests
-          [pytest]=pytest
-          [beautifulsoup4]=bs4
-        )
-        for pkg in "${!pkg_imports[@]}"; do
-          mod="${pkg_imports[$pkg]}"
-          if {{.PYTHON}} -c "import $mod" 2>/dev/null || python3 -c "import $mod" 2>/dev/null; then
-            echo "OK: $pkg installed"
+        for pkg in yaml requests pytest bs4 boto3; do
+          if {{.PYTHON}} -c "import $pkg" 2>/dev/null || python3 -c "import $pkg" 2>/dev/null; then
+            echo "OK: $pkg"
           else
-            echo "MISSING: $pkg"
-            fail=1
+            echo "MISSING: $pkg"; fail=1
           fi
         done
-        if {{.PYTHON}} -c "import boto3" 2>/dev/null || python3 -c "import boto3" 2>/dev/null; then
-          echo "OK: boto3 installed"
-        else
-          echo "MISSING: boto3"
-          fail=1
-        fi
-        if [ "$fail" -ne 0 ]; then
-          echo ""
-          echo "Install missing packages with:"
-          echo "  pip install boto3 pyyaml requests pytest beautifulsoup4"
-          exit 1
-        fi
+        [ "$fail" -ne 0 ] && { echo "pip install boto3 pyyaml requests pytest beautifulsoup4"; exit 1; } || true
 
   preflight:files:
     desc: "Check essential repository files are present"
@@ -441,34 +489,28 @@ tasks:
           terraform/variables.tf
           terraform/main.tf
           terraform/outputs.tf
+          terraform/bootstrap/main.tf
           step-functions/rag_pipeline.asl.json
+          step-functions/graph_pipeline.asl.json
           codebuild/buildspec.yml
+          codebuild/buildspec_graph.yml
           codebuild/scripts/clone_repos.sh
           codebuild/scripts/discover_modules.py
           codebuild/scripts/process_docs.py
           codebuild/scripts/requirements.txt
           scripts/test_retrieval.py
           scripts/run_pipeline.sh
-          scripts/setup_claude_bedrock.sh
           scripts/deploy.sh
-          scripts/bootstrap_state.sh
         )
         for f in "${files[@]}"; do
           if [ -f "$f" ]; then
             echo "OK: $f"
           else
-            echo "MISSING: $f"
-            fail=1
+            echo "MISSING: $f"; fail=1
           fi
-          if [[ "$f" == *.sh ]] && [ -f "$f" ] && [ ! -x "$f" ]; then
-            echo "WARN: $f is not executable — run 'chmod +x $f'"
-          fi
+          [[ "$f" == *.sh ]] && [ -f "$f" ] && [ ! -x "$f" ] && echo "WARN: $f not executable"
         done
-        if [ "$fail" -ne 0 ]; then
-          echo ""
-          echo "Repository is incomplete. Re-run the build stages for missing files."
-          exit 1
-        fi
+        [ "$fail" -ne 0 ] && { echo "Repository incomplete."; exit 1; } || true
 
   preflight:terraform:
     desc: "Check Terraform formatting and syntax"
@@ -477,46 +519,35 @@ tasks:
         if terraform -chdir={{.TF_DIR}} fmt -check -recursive 2>/dev/null; then
           echo "OK: Terraform formatting"
         else
-          echo "FAIL: Terraform files need formatting. Run 'task fmt'."
-          exit 1
+          echo "FAIL: Run 'task fmt'"; exit 1
         fi
       - |
         if terraform -chdir={{.TF_DIR}} init -backend=false -input=false &>/dev/null && \
            terraform -chdir={{.TF_DIR}} validate &>/dev/null; then
           echo "OK: Terraform validates"
         else
-          echo "FAIL: Terraform validation failed. Run 'terraform -chdir={{.TF_DIR}} validate'."
-          exit 1
+          echo "FAIL: Run 'terraform -chdir={{.TF_DIR}} validate'"; exit 1
         fi
 
-  # ── Claude Code integration ────────────────────────────────────────────────
+  # ── Claude Code / Bedrock ───────────────────────────────────────────────────
 
   claude:setup:
     desc: "Configure Claude Code to use Amazon Bedrock as its backend"
     summary: |
-      Sets up environment variables so Claude Code routes requests through
+      Sets environment variables so Claude Code routes LLM calls through
       Amazon Bedrock instead of the Anthropic API directly.
 
-      Sets four environment variables:
-        CLAUDE_CODE_USE_BEDROCK=1
-        ANTHROPIC_BEDROCK_REGION=<region>
-        AWS_REGION=<region>
-        ANTHROPIC_MODEL=<model>
-
-      After running this task, start Claude Code with 'claude' in the same
-      shell and it will use Bedrock automatically.
-
       Optional vars:
-        CLAUDE_REGION  — Bedrock region (default: us-west-2)
+        CLAUDE_REGION  — Bedrock region (default: us-east-1)
         CLAUDE_MODEL   — model ID (default: claude-sonnet-4-20250514)
         PERSIST=true   — append exports to ~/.bashrc
 
       Example:
         task claude:setup
-        task claude:setup CLAUDE_REGION=us-east-1
+        task claude:setup CLAUDE_REGION=us-west-2
         task claude:setup PERSIST=true
     vars:
-      CLAUDE_REGION: '{{.CLAUDE_REGION | default "us-west-2"}}'
+      CLAUDE_REGION: '{{.CLAUDE_REGION | default "us-east-1"}}'
       CLAUDE_MODEL: '{{.CLAUDE_MODEL | default "claude-sonnet-4-20250514"}}'
     cmds:
       - |
@@ -525,7 +556,7 @@ tasks:
           --model  {{.CLAUDE_MODEL}} \
           {{if eq .PERSIST "true"}}--persist{{end}}
 
-  # ── MCP server ─────────────────────────────────────────────────────────────
+  # ── MCP server ──────────────────────────────────────────────────────────────
 
   mcp:install:
     desc: "Install MCP server dependencies into .venv"
@@ -537,10 +568,10 @@ tasks:
     desc: "Register the MCP server with Claude Code (.claude/settings.local.json)"
     summary: |
       Writes the hashicorp-rag mcpServers entry into .claude/settings.local.json
-      so that Claude Code starts the MCP server automatically.
+      so Claude Code starts the MCP server automatically on open.
 
-      After running this task, restart Claude Code. The tools
-      search_hashicorp_docs and get_index_info will be available.
+      After running, restart Claude Code — search_hashicorp_docs and
+      get_index_info tools will be available automatically.
 
       Example:
         task mcp:setup KENDRA_INDEX_ID=ABCDEFGHIJ
@@ -555,14 +586,8 @@ tasks:
   mcp:test:
     desc: "Smoke-test the MCP server tools against the live Kendra index"
     summary: |
-      Runs the MCP server tool functions directly to confirm that credentials,
-      environment variables, and retrieval are all working correctly.
-
-      Checks:
-        1. get_index_info         — verifies configuration
-        2. search_hashicorp_docs  — basic query
-        3. search_hashicorp_docs  — filtered query (product_family=vault)
-        4. search_hashicorp_docs  — no-results edge case
+      Calls MCP server tool functions directly to confirm credentials,
+      environment, and retrieval are all working.
 
       Example:
         task mcp:test KENDRA_INDEX_ID=ABCDEFGHIJ
@@ -574,7 +599,7 @@ tasks:
     cmds:
       - "{{.PYTHON}} mcp/test_server.py"
 
-  # ── CI helpers ─────────────────────────────────────────────────────────────
+  # ── CI helpers ──────────────────────────────────────────────────────────────
 
   ci:
     desc: "Run all CI checks locally (fmt:check + validate + shellcheck + tests)"

@@ -1,4 +1,4 @@
-# hashicorp-bedrock-ai-rag — Build Checklist
+# aws-hashi-knowledge-base — Build Checklist
 
 ## Status: Complete
 

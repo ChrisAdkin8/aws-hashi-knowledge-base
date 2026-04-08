@@ -5,8 +5,6 @@
 *.tfplan
 *.auto.tfvars
 !terraform/terraform.tfvars.example
-.terraform.lock.hcl
-terraform/.terraform.lock.hcl
 terraform/terraform.tfvars
 kb.auto.tfvars
 

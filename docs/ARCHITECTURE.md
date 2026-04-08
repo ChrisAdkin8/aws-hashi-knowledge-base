@@ -1,63 +1,112 @@
-# Architecture — HashiCorp Kendra RAG Pipeline
+# Architecture — HashiCorp RAG + Graph Pipeline
 
 ## Overview
 
-A production-grade pipeline that ingests HashiCorp documentation into **Amazon Kendra** for use as a grounding source in AI coding assistants powered by **Amazon Bedrock** (Claude). The pipeline runs weekly via EventBridge Scheduler and self-heals from transient failures via Step Functions retry logic.
+A production-grade system on AWS providing two complementary data pipelines and a unified retrieval layer:
 
-Kendra provides NLP-powered retrieval — no embedding model, vector database, or chunking configuration is required. Documents are pre-split semantically by the ingestion pipeline to improve passage quality.
+1. **HashiCorp Docs Pipeline** — ingests HashiCorp product documentation into Amazon Kendra for NLP-powered semantic retrieval. No embedding model, vector database, or chunking configuration required.
+2. **Terraform Graph Store** — extracts Terraform resource dependency graphs from real workspaces via [rover](https://github.com/im2nguyen/rover) and loads them into Amazon Neptune (property graph database). This gives AI assistants a queryable model of real infrastructure topology.
+3. **Unified MCP Server** — a single Model Context Protocol server that routes queries to Kendra or Neptune depending on intent, merges results, and surfaces them to Claude Code.
+
+---
+
+## Terraform Module Structure
+
+```
+terraform/
+├── bootstrap/                    # Separate root module — creates remote state bucket (local backend)
+│   └── main.tf                   # Calls modules/state-backend
+├── modules/
+│   ├── hashicorp-docs-pipeline/  # Kendra + ingestion pipeline
+│   │   ├── iam.tf                # Five IAM roles (least-privilege)
+│   │   ├── s3.tf                 # RAG docs S3 bucket
+│   │   ├── kendra.tf             # Kendra index + data source
+│   │   ├── locals.tf             # Computed names / IDs
+│   │   ├── data.tf               # AWS data sources (e.g., account caller identity)
+│   │   ├── variables.tf          # Module inputs (account_id, region, force_destroy, tags, …)
+│   │   └── outputs.tf            # kendra_index_id, rag_bucket_name, state_machine_arn, …
+│   ├── terraform-graph-store/    # Neptune + graph pipeline
+│   │   ├── main.tf               # Neptune cluster, instances, subnet/param groups
+│   │   ├── s3.tf                 # Graph staging S3 bucket
+│   │   ├── codebuild.tf          # CodeBuild project (VPC-enabled), security groups
+│   │   ├── sfn.tf                # Step Functions state machine, EventBridge scheduler, alarms
+│   │   ├── iam.tf                # CodeBuild, Step Functions, Scheduler roles
+│   │   ├── locals.tf             # Computed names
+│   │   ├── variables.tf          # Module inputs (vpc_id, subnet_ids, repo_uris, …)
+│   │   └── outputs.tf            # Neptune endpoints, state_machine_arn, staging_bucket_name, …
+│   └── state-backend/            # KMS-encrypted S3 state bucket
+│       ├── main.tf               # S3 bucket with encryption, versioning, public access block
+│       ├── locals.tf             # Deterministic bucket name (account_id + sha256 suffix)
+│       ├── data.tf               # aws_caller_identity
+│       └── outputs.tf            # bucket_name, bucket_arn, backend_config
+├── main.tf                       # Calls both pipeline modules
+├── data.tf                       # aws_caller_identity (passed to modules as account_id)
+├── variables.tf                  # All root-level inputs
+├── outputs.tf                    # Proxies all module outputs (Neptune outputs null-safe via try())
+└── versions.tf                   # required_version >= 1.10 < 1.15, aws ~> 5.100
+```
+
+---
 
 ## Components
 
-### Orchestration Layer
+### Orchestration
 
 | Component | Role |
 |---|---|
-| **EventBridge Scheduler** | Cron trigger — fires weekly (default: Sundays 02:00 UTC), passes input JSON to Step Functions |
-| **Step Functions** | Pipeline orchestrator — 8-state ASL machine: Init → StartBuild → StartSync → WaitForSync → ListSyncJobs → CheckSyncStatus → ValidateRetrieval → PipelineComplete |
+| **EventBridge Scheduler (docs)** | Cron trigger for the docs pipeline (default: Sundays 02:00 UTC) |
+| **EventBridge Scheduler (graph)** | Cron trigger for the graph pipeline (default: Sundays 03:00 UTC) |
+| **Step Functions (docs)** | Docs pipeline orchestrator — 8-state ASL machine |
+| **Step Functions (graph)** | Graph pipeline orchestrator — Map state over repo list (MaxConcurrency: 3) |
 
-### Data Ingestion
-
-| Component | Role |
-|---|---|
-| **AWS CodeBuild** | Runs data processing scripts inside an isolated Linux container (`BUILD_GENERAL1_MEDIUM`, 7 GB RAM, 4 vCPU) |
-| **Amazon S3** | Staging area for processed markdown documents and Kendra metadata sidecar files (`.metadata.json`) |
-| **`hashicorp/web-unified-docs`** | Single GitHub repo that is the authoritative documentation source for Vault, Consul, Nomad, Terraform Enterprise, and HCP Terraform. Docs live under `content/{product}/`. Individual product repos (`hashicorp/vault` etc.) have deprecated their `website/` trees. |
-
-### Retrieval Index
+### Data Ingestion — Docs Pipeline
 
 | Component | Role |
 |---|---|
-| **Amazon Kendra** | Managed retrieval service — indexes S3 documents using built-in NLP, serves keyword + semantic queries |
-| **Kendra S3 Data Source** | Watches the RAG S3 bucket; syncs new and changed documents on each pipeline run |
+| **AWS CodeBuild** | Runs data processing scripts (`BUILD_GENERAL1_MEDIUM`, 7 GB RAM, 4 vCPU) |
+| **Amazon S3 (RAG docs)** | Staging area for processed markdown and Kendra `.metadata.json` sidecars |
+| **Amazon Kendra** | Managed NLP retrieval index — keyword + semantic ranking, no embedding model needed |
+| **Kendra S3 Data Source** | Watches the RAG S3 bucket; syncs new and changed documents after each CodeBuild run |
 
-### AI Inference
+### Data Ingestion — Graph Pipeline
 
 | Component | Role |
 |---|---|
-| **Amazon Bedrock** | Hosts Claude models for AI inference — used at query time, not ingestion time |
+| **AWS CodeBuild (graph)** | VPC-enabled; runs Terraform + rover per repo, then `ingest_graph.py`; can reach Neptune privately |
+| **Amazon S3 (graph staging)** | Stores rover JSON output before Neptune ingestion (30-day lifecycle) |
+| **[rover](https://github.com/im2nguyen/rover)** | Terraform plan visualiser — outputs `nodes[]` and `edges[]` JSON representing the resource DAG |
+| **Amazon Neptune** | Managed property graph database (openCypher). Stores resource nodes and dependency edges. |
+
+### Retrieval
+
+| Component | Role |
+|---|---|
 | **MCP Server** (`mcp/server.py`) | Bridges Claude Code to Kendra via the Model Context Protocol; exposes `search_hashicorp_docs` and `get_index_info` tools |
+| **Amazon Bedrock** | Hosts Claude models for AI inference — used at query time, not ingestion time |
 
 ### Supporting Infrastructure
 
 | Component | Role |
 |---|---|
-| **IAM Roles** | Least-privilege execution roles for each service |
-| **CloudWatch Logs** | Build logs from CodeBuild; Step Functions execution history |
-| **SNS + CloudWatch Alarms** | Optional email alerts on pipeline failure (set `notification_email` variable) |
-| **GitHub Actions (OIDC)** | CI/CD via OIDC federation — no long-lived IAM keys (set `create_github_oidc_provider = true`) |
+| **IAM Roles** | Least-privilege execution roles for each service (separate per pipeline) |
+| **CloudWatch Logs** | CodeBuild build logs; Step Functions execution history |
+| **SNS + CloudWatch Alarms** | Optional email alerts on pipeline failure (`notification_email` variable) |
+| **GitHub Actions (OIDC)** | CI/CD via OIDC federation — no long-lived IAM keys (`create_github_oidc_provider = true`) |
+| **KMS** | Encrypts the Terraform state S3 bucket |
 
-## Data Flow
+---
+
+## Data Flow — Docs Pipeline
 
 ```
-EventBridge Scheduler
-    │  weekly cron (cron(0 2 ? * SUN *))
+EventBridge Scheduler (cron(0 2 ? * SUN *))
+    │
     ▼
 Step Functions: Init
     │  inject params: index ID, data source ID, bucket, repo URL, pipeline_target
     ▼
-Step Functions: StartBuild
-    │  codebuild:startBuild.sync — waits for CodeBuild to complete
-    │  passes PIPELINE_TARGET env var (all | docs | registry | discuss | blogs)
+Step Functions: StartBuild  [codebuild:startBuild.sync — waits for completion]
+    │
     ▼
 CodeBuild  [steps marked * are conditional on PIPELINE_TARGET]
     ├── pre_build:  clone_repos.sh        — [*all, docs]     shallow-clone HashiCorp + provider repos
@@ -69,91 +118,100 @@ CodeBuild  [steps marked * are conditional on PIPELINE_TARGET]
     │               fetch_blogs.py        — [*all, blogs]    (parallel)
     │               deduplicate.py        — cross-source deduplication
     │               generate_metadata.py  — write Kendra .metadata.json sidecars
-    └── post_build: aws s3 sync → S3 RAG bucket (--delete keeps bucket current)
+    └── post_build: aws s3 sync → S3 RAG bucket
     ▼
 Step Functions: StartSync
-    │  kendra:startDataSourceSyncJob — triggers Kendra to index new/changed S3 documents
+    │  kendra:startDataSourceSyncJob
     ▼
-Step Functions: WaitForSync (60s wait) → ListSyncJobs → CheckSyncStatus (poll loop)
-    │  kendra:listDataSourceSyncJobs until History[0].Status ∈ {SUCCEEDED, INCOMPLETE}
+Step Functions: WaitForSync (60s) → ListSyncJobs → CheckSyncStatus (poll loop)
     ▼
-Amazon Kendra
-    │  NLP-powered index — keyword extraction, entity recognition, semantic ranking
-    └─ Custom metadata attributes: product, product_family, source_type
+Amazon Kendra  [NLP index — keyword + semantic ranking]
+    └─ Custom metadata: product, product_family, source_type
     ▼
 Step Functions: ValidateRetrieval
-    │  Map state — 10 sequential kendra:query calls covering all product families
-    └─ Confirms index is queryable before marking pipeline complete
+    │  Map state — 10 sequential kendra:query calls across all product families
     ▼
 PipelineComplete
 ```
 
+---
+
+## Data Flow — Graph Pipeline
+
+```
+EventBridge Scheduler (cron(0 3 ? * SUN *))
+    │
+    ▼
+Step Functions: GraphPipelineStart
+    │
+    ▼
+Map state (MaxConcurrency: 3) — iterate over graph_repo_uris
+    │
+    ├── For each repo:
+    │       codebuild:startBuild.sync  [VPC-enabled CodeBuild]
+    │           ├── terraform init + plan -out=tfplan
+    │           ├── rover --tfplan-json-file tfplan.json --standalone
+    │           └── python ingest_graph.py  (openCypher MERGE into Neptune)
+    │
+    └── Retry on TaskFailed (2 retries, 30s interval, 2× backoff)
+    ▼
+GraphPipelineComplete
+```
+
+---
+
 ## IAM Design
 
-Each service has a dedicated least-privilege execution role:
+### hashicorp-docs-pipeline module
 
 | Role | Principals | Key permissions |
 |---|---|---|
-| `rag-pipeline-codebuild` | `codebuild.amazonaws.com` | `s3:PutObject/GetObject/ListBucket/DeleteObject`, `logs:CreateLogGroup/PutLogEvents`, `secretsmanager:GetSecretValue` |
+| `rag-pipeline-codebuild` | `codebuild.amazonaws.com` | `s3:PutObject/GetObject/ListBucket/DeleteObject`, `logs:*`, `secretsmanager:GetSecretValue`, `kms:Decrypt/GenerateDataKey` (via service condition) |
 | `rag-pipeline-step-functions` | `states.amazonaws.com` | `codebuild:StartBuild/BatchGetBuilds`, `kendra:StartDataSourceSyncJob/ListDataSourceSyncJobs/Query` |
-| `rag-pipeline-scheduler` | `scheduler.amazonaws.com` | `states:StartExecution` |
+| `rag-pipeline-scheduler` | `scheduler.amazonaws.com` | `states:StartExecution` on the docs state machine ARN only |
 | `rag-kendra-s3` | `kendra.amazonaws.com` | `s3:GetObject/ListBucket` on the RAG bucket |
-| `github-actions-terraform` | GitHub Actions OIDC | Terraform state read/write, infra describe |
+| `github-actions-terraform` | GitHub Actions OIDC | Terraform state read/write, infra describe (scoped per-service, no wildcard) |
 
-## Document Processing
+### terraform-graph-store module
 
-### Blog content fetching
+| Role | Principals | Key permissions |
+|---|---|---|
+| `graph-codebuild` | `codebuild.amazonaws.com` | `ec2:CreateNetworkInterface*` (VPC), `neptune-db:connect`, `s3:PutObject/GetObject` on staging bucket, `logs:*` |
+| `graph-step-functions` | `states.amazonaws.com` | `codebuild:StartBuild/BatchGetBuilds`, `logs:*` |
+| `graph-scheduler` | `scheduler.amazonaws.com` | `states:StartExecution` on the graph state machine ARN only |
 
-`fetch_blogs.py` reads content directly from the RSS/Atom feed rather than scraping individual article URLs. hashicorp.com is behind Cloudflare bot protection — a plain HTTP GET to an article URL returns "We're verifying your browser" (~65 bytes) instead of article content.
+---
 
-Both feeds contain full article HTML inline:
-- `https://www.hashicorp.com/blog/feed.xml` — Atom format, `<content>` tag per entry
-- `https://medium.com/feed/hashicorp-engineering` — RSS format, `<content:encoded>` tag per item
+## Document Processing (Docs Pipeline)
 
-`_parse_feed()` extracts the inline content tag and stores it in the entry dict. `process_feed()` HTML-strips it with BeautifulSoup before writing the output file. URL scraping (`fetch_article_content()`) is retained as a fallback for feeds that do not include inline content.
+### Semantic pre-splitting
+
+Markdown files are split at `##`/`###` heading boundaries before upload. Each section becomes a separate S3 object with its own `.metadata.json` sidecar:
+
+- Sections under 200 characters are merged into the previous section
+- Sections over ~4,000 characters are split at code-fence boundaries
+- Each output file begins with a compact attribution prefix: `[source_type:product] Title — Section`
 
 ### Content exclusions
 
-CDKTF (CDK for Terraform) documentation is intentionally excluded from the index:
+CDKTF documentation is intentionally excluded:
 
 | Script | Mechanism |
 |---|---|
-| `process_docs.py` | `CDKTF_EXCLUDE_RE` regex drops any file whose repo-relative path contains `cdktf/`, `terraform-cdk/`, or `cdk-for-terraform/` |
-| `fetch_blogs.py` | Posts with a CDKTF keyword in the title, or ≥3 CDKTF mentions in the body, are skipped |
-| `fetch_discuss.py` | Threads with a CDKTF keyword in the title are skipped |
-| `fetch_github_issues.py` | Issues with a CDKTF keyword in the title are skipped |
+| `process_docs.py` | `CDKTF_EXCLUDE_RE` drops files whose path contains `cdktf/`, `terraform-cdk/`, or `cdk-for-terraform/` |
+| `fetch_blogs.py` | Posts with CDKTF in the title or ≥3 CDKTF body mentions are skipped |
+| `fetch_discuss.py` | Threads with CDKTF in the title are skipped |
+| `fetch_github_issues.py` | Issues with CDKTF in the title are skipped |
 
-### Semantic pre-splitting (`process_docs.py`)
+### Blog content fetching
 
-Markdown files are split at `##`/`###` heading boundaries before upload. Each section becomes a separate file with its own Kendra metadata sidecar:
+`fetch_blogs.py` reads content from RSS/Atom feed inline tags — it does **not** scrape article URLs. hashicorp.com is Cloudflare-protected; article URLs return "We're verifying your browser" instead of content.
 
-- Sections under 200 characters are merged into the previous section
-- Sections over ~4,000 characters are split at code-fence boundaries to avoid cutting inside code blocks
-- Each output file begins with a compact attribution prefix: `[source_type:product] Title — Section`
+Both feeds include full article HTML inline:
+- `https://www.hashicorp.com/blog/feed.xml` — Atom format, `<content>` tag
+- `https://medium.com/feed/hashicorp-engineering` — RSS format, `<content:encoded>` tag
 
-This pre-splitting ensures Kendra receives well-bounded passages rather than whole large documents, improving retrieval precision.
-
-### Kendra metadata attributes
-
-Every document has a `.metadata.json` sidecar file written by `generate_metadata.py`. Kendra reads these automatically when syncing:
-
-```json
-{
-  "Title": "Vault — Auth Methods",
-  "ContentType": "PLAIN_TEXT",
-  "Attributes": {
-    "product":        "vault",
-    "product_family": "vault",
-    "source_type":    "documentation"
-  }
-}
-```
-
-`DocumentId` and `_source_uri` are intentionally omitted:
-- `DocumentId` — Kendra auto-assigns from the S3 object key. Providing a full `s3://` URI causes metadata validation failures.
-- `_source_uri` — Kendra requires an HTTP/HTTPS URL; only S3 URIs are available at ingestion time.
-
-These attributes are indexed by Kendra and available as filters in the `search_hashicorp_docs` MCP tool (`product_family`, `source_type`).
+---
 
 ## Kendra Index Configuration
 
@@ -164,14 +222,37 @@ These attributes are indexed by Kendra and available as filters in the `search_h
 | Sync schedule | On-demand (triggered by Step Functions after each CodeBuild run) |
 | Custom attributes | `product` (STRING), `product_family` (STRING), `source_type` (STRING) |
 
-> **Edition note:** `DEVELOPER_EDITION` is capped at 10,000 documents. This pipeline typically generates 10,000–30,000+ documents across all source types; `ENTERPRISE_EDITION` is required for production use. The edition cannot be changed in-place — changing it destroys and recreates the index.
+> **Edition note:** `DEVELOPER_EDITION` is capped at 10,000 documents. This pipeline typically generates 10,000–30,000+ documents. The edition cannot be changed in-place — changing it destroys and recreates the index.
+
+---
+
+## Neptune Configuration
+
+| Setting | Value / default |
+|---|---|
+| Engine | Neptune (openCypher + Gremlin) |
+| Default instance class | `db.r6g.large` |
+| IAM authentication | Enabled (`neptune_iam_auth_enabled = true`) |
+| VPC | Required — cluster is in private subnets; CodeBuild uses VPC config to reach it |
+| Port | 8182 |
+| Backup retention | 7 days |
+
+The CodeBuild security group has an egress rule permitting port 8182 to the Neptune security group. No public access is exposed.
+
+---
 
 ## State Machine Design
 
-The Step Functions ASL (`step-functions/rag_pipeline.asl.json`) uses:
+### Docs pipeline ASL (`step-functions/rag_pipeline.asl.json`)
 
-- `.sync` resource integration for CodeBuild — automatic poll via CloudWatch Events, no sleep loop
+- `.sync` resource integration for CodeBuild — automatic poll via CloudWatch Events
 - Manual poll loop for Kendra sync (60-second wait between `ListDataSourceSyncJobs` calls)
-- Sequential `Map` state (`MaxConcurrency: 1`) for the 10 validation queries — avoids Kendra query throttling
-- Retry on `States.TaskFailed` for the CodeBuild step (2 retries, 30-second interval, 2× backoff)
-- Catch-all error states for CodeBuild (`BuildFailed`), Kendra sync (`SyncFailed`), and validation (`ValidationFailed`)
+- Sequential `Map` state (`MaxConcurrency: 1`) for 10 validation queries — avoids Kendra throttling
+- Retry on `States.TaskFailed` for the CodeBuild step (2 retries, 30s interval, 2× backoff)
+
+### Graph pipeline ASL (`step-functions/graph_pipeline.asl.json`)
+
+- `Map` state with `MaxConcurrency: 3` — runs up to 3 repo ingestions concurrently
+- `.sync` CodeBuild integration per repo
+- Retry on `States.TaskFailed` (2 retries, 30s interval, 2× backoff)
+- Catch: routes to `PipelineFailed` state on unrecoverable errors

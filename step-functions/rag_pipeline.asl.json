@@ -169,6 +169,10 @@
               "IndexId.$":   "$.IndexId",
               "QueryText.$": "$.QueryText"
             },
+            "ResultSelector": {
+              "QueryId.$":              "$.QueryId",
+              "TotalNumberOfResults.$": "$.TotalNumberOfResults"
+            },
             "ResultPath": "$.queryResult",
             "Retry": [
               {

@@ -37,22 +37,21 @@ if [[ -z "${REPO_URI}" ]]; then
   usage
 fi
 
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-STATE_BUCKET="${ACCOUNT_ID}-tf-state-$(echo -n "${ACCOUNT_ID}" | sha256sum | cut -c1-8)"
-
-echo "==> Step 1: Bootstrap state bucket"
-bash scripts/bootstrap_state.sh --region "${REGION}"
-
-echo ""
-echo "==> Step 2: terraform init + apply"
 export AWS_DEFAULT_REGION="${REGION}"
 
-# Detect actual bucket region (may differ from deployment region if bucket pre-exists)
+echo "==> Step 1: Bootstrap state bucket (terraform/bootstrap)"
+terraform -chdir="terraform/bootstrap" init -input=false
+terraform -chdir="terraform/bootstrap" apply -auto-approve -var="region=${REGION}"
+
+STATE_BUCKET=$(terraform -chdir="terraform/bootstrap" output -raw bucket_name)
 BUCKET_REGION=$(aws s3api get-bucket-location --bucket "${STATE_BUCKET}" --query LocationConstraint --output text 2>/dev/null || echo "${REGION}")
 if [[ "${BUCKET_REGION}" == "None" ]] || [[ -z "${BUCKET_REGION}" ]]; then
   BUCKET_REGION="us-east-1"
 fi
-echo "State bucket region: ${BUCKET_REGION} (deploy region: ${REGION})"
+echo "State bucket: ${STATE_BUCKET} (region: ${BUCKET_REGION})"
+
+echo ""
+echo "==> Step 2: terraform init + apply"
 
 terraform -chdir="${TF_DIR}" init \
   -backend-config="bucket=${STATE_BUCKET}" \
