@@ -10,9 +10,10 @@ Tools:
 Environment variables:
   AWS_REGION          — AWS region (defaults to boto3 session region, then us-east-1)
   AWS_KENDRA_INDEX_ID — Kendra index ID (required for Kendra tools)
-  NEPTUNE_ENDPOINT    — Neptune cluster endpoint (required for graph tools)
+  NEPTUNE_ENDPOINT    — Neptune cluster endpoint (required for direct graph access)
   NEPTUNE_PORT        — Neptune port (default 8182)
   NEPTUNE_IAM_AUTH    — Enable SigV4 auth for Neptune (default "true")
+  NEPTUNE_PROXY_URL   — API Gateway URL for Neptune proxy (overrides direct access)
   Standard AWS credential chain (env vars, ~/.aws/credentials, instance profile, SSO)
 """
 
@@ -43,6 +44,7 @@ KENDRA_INDEX_ID = os.environ.get("AWS_KENDRA_INDEX_ID", "")
 NEPTUNE_ENDPOINT = os.environ.get("NEPTUNE_ENDPOINT", "")
 NEPTUNE_PORT = int(os.environ.get("NEPTUNE_PORT", "8182"))
 NEPTUNE_IAM_AUTH = os.environ.get("NEPTUNE_IAM_AUTH", "true").lower() == "true"
+NEPTUNE_PROXY_URL = os.environ.get("NEPTUNE_PROXY_URL", "")
 
 # Kendra confidence levels mapped to numeric equivalents for min_score filtering
 CONFIDENCE_SCORE: dict[str, float] = {
@@ -59,11 +61,41 @@ def _kendra_client() -> Any:
 
 
 def _neptune_query(query: str, parameters: dict | None = None) -> dict:
-    """Execute an openCypher query against Neptune via SigV4-signed HTTP POST.
+    """Execute an openCypher query against Neptune.
 
-    Creates fresh credentials on each call to handle temporary credential
-    expiry in the long-running MCP server process.
+    Routes through the API Gateway proxy when NEPTUNE_PROXY_URL is set,
+    otherwise connects directly (requires VPC connectivity).
     """
+    if NEPTUNE_PROXY_URL:
+        return _neptune_query_via_proxy(query, parameters)
+    return _neptune_query_direct(query, parameters)
+
+
+def _neptune_query_via_proxy(query: str, parameters: dict | None = None) -> dict:
+    """Execute an openCypher query via the API Gateway + Lambda proxy."""
+    params = parameters or {}
+    payload = json.dumps({"query": query, "parameters": params})
+    headers = {"Content-Type": "application/json"}
+
+    creds = boto3.Session().get_credentials().get_frozen_credentials()
+    aws_req = AWSRequest(method="POST", url=NEPTUNE_PROXY_URL, data=payload, headers=headers)
+    SigV4Auth(creds, "execute-api", AWS_REGION).add_auth(aws_req)
+    headers = dict(aws_req.headers)
+
+    try:
+        resp = requests.post(NEPTUNE_PROXY_URL, data=payload, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.ConnectionError:
+        return {"error": f"Cannot connect to Neptune proxy at {NEPTUNE_PROXY_URL}."}
+    except requests.exceptions.HTTPError as exc:
+        return {"error": f"Proxy HTTP {exc.response.status_code}: {exc.response.text[:500]}"}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _neptune_query_direct(query: str, parameters: dict | None = None) -> dict:
+    """Execute an openCypher query directly against Neptune (requires VPC access)."""
     if not NEPTUNE_ENDPOINT:
         return {"error": "NEPTUNE_ENDPOINT environment variable is not set."}
 

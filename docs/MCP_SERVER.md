@@ -97,16 +97,19 @@ If you prefer to configure the MCP server manually, add this to `.claude/setting
       "env": {
         "AWS_REGION": "us-east-1",
         "AWS_KENDRA_INDEX_ID": "<KENDRA_INDEX_ID>",
-        "NEPTUNE_ENDPOINT": "<NEPTUNE_CLUSTER_ENDPOINT>",
-        "NEPTUNE_PORT": "8182",
-        "NEPTUNE_IAM_AUTH": "true"
+        "NEPTUNE_PROXY_URL": "https://<API_ID>.execute-api.<REGION>.amazonaws.com/query"
       }
     }
   }
 }
 ```
 
-Omit the `NEPTUNE_*` variables if Neptune is not deployed — the Kendra tools will still work.
+**Access modes for Neptune:**
+
+- **Via proxy (recommended for outside VPC):** Set `NEPTUNE_PROXY_URL` to the API Gateway endpoint (from `terraform output neptune_proxy_url`). Requires `neptune_create_proxy = true` in Terraform. The MCP server signs requests with SigV4 for the `execute-api` service.
+- **Direct (from within VPC):** Set `NEPTUNE_ENDPOINT` and optionally `NEPTUNE_PORT` / `NEPTUNE_IAM_AUTH`. Used when running from EC2/ECS/CodeBuild inside the VPC.
+
+Omit all `NEPTUNE_*` variables if Neptune is not deployed — the Kendra tools will still work.
 
 ---
 
@@ -116,9 +119,12 @@ Omit the `NEPTUNE_*` variables if Neptune is not deployed — the Kendra tools w
 |---|---|---|---|
 | `AWS_REGION` | Yes | `us-east-1` | AWS region for Kendra and Neptune |
 | `AWS_KENDRA_INDEX_ID` | Yes (for Kendra tools) | — | Kendra index ID |
-| `NEPTUNE_ENDPOINT` | No (for graph tools) | — | Neptune cluster writer endpoint |
-| `NEPTUNE_PORT` | No | `8182` | Neptune port |
-| `NEPTUNE_IAM_AUTH` | No | `"true"` | Enable SigV4 auth for Neptune |
+| `NEPTUNE_PROXY_URL` | No (for graph tools) | — | API Gateway URL for Neptune proxy (recommended for outside VPC) |
+| `NEPTUNE_ENDPOINT` | No (for graph tools) | — | Neptune cluster writer endpoint (direct VPC access) |
+| `NEPTUNE_PORT` | No | `8182` | Neptune port (direct access only) |
+| `NEPTUNE_IAM_AUTH` | No | `"true"` | Enable SigV4 auth for Neptune (direct access only) |
+
+When `NEPTUNE_PROXY_URL` is set, it takes precedence over `NEPTUNE_ENDPOINT`. The proxy route signs requests for the `execute-api` service instead of `neptune-db`.
 
 ---
 
@@ -156,7 +162,7 @@ The graph tools query Neptune via openCypher HTTP POST with SigV4-signed request
 
 Dependency traversal uses variable-length path patterns (`[:DEPENDS_ON*1..N]`) to walk the graph up to the specified depth.
 
-> **VPC connectivity:** Neptune does not expose a public endpoint. The MCP server must be able to reach the cluster on port 8182 — via SSH tunnel, AWS Client VPN, or by running from within the VPC.
+> **VPC connectivity:** Neptune does not expose a public endpoint. For access from outside the VPC, deploy the Neptune proxy (`neptune_create_proxy = true`) and set `NEPTUNE_PROXY_URL`. For direct access, the MCP server must reach the cluster on port 8182 — via SSH tunnel, AWS Client VPN, or by running from within the VPC.
 
 ---
 
@@ -169,6 +175,8 @@ The server uses the standard AWS credential chain — no additional configuratio
 3. Instance profile (EC2/ECS/Lambda)
 4. AWS SSO (`aws sso login --profile my-profile`)
 
-Neptune SigV4 auth uses `botocore.auth.SigV4Auth` with service name `neptune-db`. Fresh credentials are obtained on each query to handle temporary credential expiry in the long-running MCP server process.
+Neptune SigV4 auth uses `botocore.auth.SigV4Auth` with service name `neptune-db` (direct access) or `execute-api` (proxy access). Fresh credentials are obtained on each query to handle temporary credential expiry in the long-running MCP server process.
+
+When using the proxy, the caller's IAM identity needs `execute-api:Invoke` on the API Gateway route.
 
 The environment variables are written to the `mcpServers` entry by `task mcp:setup` and passed to the server process automatically.

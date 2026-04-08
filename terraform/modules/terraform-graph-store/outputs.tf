@@ -52,3 +52,8 @@ output "state_machine_arn" {
   description = "ARN of the graph pipeline Step Functions state machine."
   value       = aws_sfn_state_machine.graph_pipeline.arn
 }
+
+output "neptune_proxy_url" {
+  description = "API Gateway URL for the Neptune openCypher proxy (POST /query)."
+  value       = var.create_neptune_proxy ? "${aws_apigatewayv2_api.neptune_proxy[0].api_endpoint}/query" : null
+}

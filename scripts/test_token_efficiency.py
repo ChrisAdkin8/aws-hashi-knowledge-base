@@ -215,8 +215,15 @@ def kendra_retrieve(client: object, index_id: str, query: str, top_k: int) -> st
 
 # ── Neptune helpers ───────────────────────────────────────────────────────────
 
-def neptune_query(endpoint: str, port: int, region: str, query: str) -> str:
-    """Execute an openCypher query and return the result as text."""
+def neptune_query(endpoint: str, port: int, region: str, query: str, *, proxy_url: str = "") -> str:
+    """Execute an openCypher query and return the result as text.
+
+    When *proxy_url* is set, routes through the API Gateway + Lambda proxy
+    instead of connecting directly to Neptune.
+    """
+    if proxy_url:
+        return _neptune_query_via_proxy(proxy_url, region, query)
+
     url = f"https://{endpoint}:{port}/openCypher"
     body = urllib.parse.urlencode({
         "query": query,
@@ -234,18 +241,49 @@ def neptune_query(endpoint: str, port: int, region: str, query: str) -> str:
     return json.dumps(resp.json().get("results", []), indent=2)
 
 
-def validate_neptune(endpoint: str, port: int, region: str) -> None:
-    """Verify Neptune connectivity with a simple count query."""
+def _neptune_query_via_proxy(proxy_url: str, region: str, query: str) -> str:
+    """Execute an openCypher query via the API Gateway + Lambda proxy."""
+    payload = json.dumps({"query": query, "parameters": {}})
+    headers = {"Content-Type": "application/json"}
+
+    creds = boto3.Session().get_credentials().get_frozen_credentials()
+    aws_req = AWSRequest(method="POST", url=proxy_url, data=payload, headers=headers)
+    SigV4Auth(creds, "execute-api", region).add_auth(aws_req)
+    headers = dict(aws_req.headers)
+
+    resp = requests.post(proxy_url, data=payload, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return json.dumps(resp.json().get("results", []), indent=2)
+
+
+def validate_neptune(endpoint: str, port: int, region: str, *, proxy_url: str = "", required: bool = True) -> bool:
+    """Verify Neptune connectivity with a simple count query.
+
+    Returns True if reachable.  When *required* is False (e.g. mode=all),
+    logs a warning and returns False instead of aborting.
+    """
     try:
-        neptune_query(endpoint, port, region, "MATCH (n) RETURN count(n) AS total LIMIT 1")
-        log.info("Neptune cluster at '%s:%d' is reachable.", endpoint, port)
+        neptune_query(endpoint, port, region, "MATCH (n) RETURN count(n) AS total LIMIT 1", proxy_url=proxy_url)
+        target = proxy_url or f"{endpoint}:{port}"
+        log.info("Neptune at '%s' is reachable.", target)
+        return True
     except requests.exceptions.ConnectionError:
-        log.error("Cannot connect to Neptune at %s:%d. Neptune is VPC-only — "
-                  "ensure connectivity (SSH tunnel, VPN, or run from within VPC).", endpoint, port)
-        sys.exit(1)
+        target = proxy_url or f"{endpoint}:{port}"
+        msg = "Cannot connect to Neptune at %s."
+        if not proxy_url:
+            msg += (" Neptune is VPC-only — ensure connectivity "
+                    "(SSH tunnel, VPN, proxy, or run from within VPC).")
+        if required:
+            log.error(msg, target)
+            sys.exit(1)
+        log.warning(msg + " Skipping Neptune tests.", target)
+        return False
     except Exception as exc:
-        log.error("Neptune validation failed: %s", exc)
-        sys.exit(1)
+        if required:
+            log.error("Neptune validation failed: %s", exc)
+            sys.exit(1)
+        log.warning("Neptune validation failed: %s — skipping Neptune tests.", exc)
+        return False
 
 
 # ── Test runners ──────────────────────────────────────────────────────────────
@@ -290,13 +328,13 @@ def run_kendra_tests(client: object, index_id: str, top_k: int) -> tuple[int, in
     return total_rag, total_raw
 
 
-def run_graph_tests(endpoint: str, port: int, region: str) -> tuple[int, int]:
+def run_graph_tests(endpoint: str, port: int, region: str, *, proxy_url: str = "") -> tuple[int, int]:
     _print_header("Neptune Graph — Token Efficiency")
     total_graph, total_raw = 0, 0
     for test in GRAPH_TEST_QUERIES:
         query, cypher, raw_tokens = test["query"], test["cypher"], test["raw_tokens"]
         try:
-            result_text = neptune_query(endpoint, port, region, cypher)
+            result_text = neptune_query(endpoint, port, region, cypher, proxy_url=proxy_url)
             graph_tokens = _count_tokens(result_text)
         except Exception as exc:
             log.error("Neptune query failed for '%s': %s", query[:40], exc)
@@ -313,6 +351,7 @@ def run_graph_tests(endpoint: str, port: int, region: str) -> tuple[int, int]:
 def run_combined_tests(
     client: object, index_id: str, top_k: int,
     endpoint: str, port: int, region: str,
+    *, proxy_url: str = "",
 ) -> tuple[int, int]:
     _print_header("Combined (Kendra + Neptune) — Token Efficiency")
     total_combined, total_raw = 0, 0
@@ -321,7 +360,7 @@ def run_combined_tests(
         raw_tokens = test["raw_tokens"]
         try:
             kendra_text = kendra_retrieve(client, index_id, test["kendra_query"], top_k)
-            graph_text = neptune_query(endpoint, port, region, test["cypher"])
+            graph_text = neptune_query(endpoint, port, region, test["cypher"], proxy_url=proxy_url)
             combined_text = kendra_text + "\n\n--- Graph Context ---\n\n" + graph_text
             combined_tokens = _count_tokens(combined_text)
         except Exception as exc:
@@ -345,6 +384,8 @@ def main() -> None:
     parser.add_argument("--kendra-index-id", default="")
     parser.add_argument("--neptune-endpoint", default="")
     parser.add_argument("--neptune-port", type=int, default=8182)
+    parser.add_argument("--neptune-proxy-url", default="",
+                        help="API Gateway URL for Neptune proxy (overrides direct access)")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--mode", choices=["kendra", "graph", "combined", "all"], default="all")
     args = parser.parse_args()
@@ -355,8 +396,8 @@ def main() -> None:
     if needs_kendra and not args.kendra_index_id:
         log.error("--kendra-index-id is required for mode '%s'.", args.mode)
         sys.exit(1)
-    if needs_neptune and not args.neptune_endpoint:
-        log.error("--neptune-endpoint is required for mode '%s'.", args.mode)
+    if needs_neptune and not args.neptune_endpoint and not args.neptune_proxy_url:
+        log.error("--neptune-endpoint or --neptune-proxy-url is required for mode '%s'.", args.mode)
         sys.exit(1)
 
     try:
@@ -376,8 +417,14 @@ def main() -> None:
         kendra_client = boto3.client("kendra", region_name=args.region)
         validate_kendra_index(kendra_client, args.kendra_index_id, args.region)
 
+    neptune_ok = False
     if needs_neptune:
-        validate_neptune(args.neptune_endpoint, args.neptune_port, args.region)
+        # In "all" mode, Neptune is optional — skip gracefully if unreachable.
+        neptune_ok = validate_neptune(
+            args.neptune_endpoint, args.neptune_port, args.region,
+            proxy_url=args.neptune_proxy_url,
+            required=(args.mode != "all"),
+        )
 
     grand_result, grand_raw = 0, 0
 
@@ -386,15 +433,17 @@ def main() -> None:
         grand_result += r
         grand_raw += raw
 
-    if args.mode in ("graph", "all"):
-        r, raw = run_graph_tests(args.neptune_endpoint, args.neptune_port, args.region)
+    if args.mode in ("graph", "all") and (args.mode == "graph" or neptune_ok):
+        r, raw = run_graph_tests(args.neptune_endpoint, args.neptune_port, args.region,
+                                 proxy_url=args.neptune_proxy_url)
         grand_result += r
         grand_raw += raw
 
-    if args.mode in ("combined", "all"):
+    if args.mode in ("combined", "all") and (args.mode == "combined" or neptune_ok):
         r, raw = run_combined_tests(
             kendra_client, args.kendra_index_id, args.top_k,
             args.neptune_endpoint, args.neptune_port, args.region,
+            proxy_url=args.neptune_proxy_url,
         )
         grand_result += r
         grand_raw += raw

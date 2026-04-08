@@ -55,7 +55,7 @@ This repository provisions a high-precision Amazon Kendra RAG pipeline for the H
 | `codebuild/buildspec_graph.yml` | Graph pipeline CodeBuild phases (terraform plan → rover → ingest) |
 | `codebuild/scripts/` | Data processing scripts (clone, discover, process, fetch, deduplicate, metadata) |
 | `scripts/` | Deploy, bootstrap, and operational scripts |
-| `mcp/server.py` | MCP server — exposes Kendra index as Claude Code tools |
+| `mcp/server.py` | MCP server — exposes Kendra index and Neptune graph as Claude Code tools |
 | `docs/` | Architecture, runbook, MCP guide, diagrams |
 
 ---
@@ -71,6 +71,8 @@ This repository provisions a high-precision Amazon Kendra RAG pipeline for the H
 * **Bedrock model access**: Must be explicitly enabled per region in the Bedrock console (Model access → Request access for the desired Claude model). Used at query time only — not during ingestion.
 
 * **Neptune is opt-in**: Set `create_neptune = true` in `terraform/terraform.tfvars` and supply `neptune_vpc_id` and `neptune_subnet_ids`. Without this, `task graph:populate` will fail with `graph_state_machine_arn not found`.
+
+* **Neptune proxy is opt-in**: Set `neptune_create_proxy = true` to deploy an API Gateway + Lambda proxy for Neptune access from outside the VPC. The MCP server uses `NEPTUNE_PROXY_URL` to route through the proxy instead of connecting directly.
 
 * **`template_configuration` not `s3_configuration`**: The Kendra S3 data source uses `template_configuration` with `inclusionPatterns = ["**/*.md"]`. Using `exclusion_patterns` blocks `.metadata.json` sidecars from sync participation and causes `"invalid metadata"` errors. Using `inclusion_patterns` avoids this.
 

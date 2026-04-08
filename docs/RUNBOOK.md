@@ -114,16 +114,28 @@ aws stepfunctions list-executions \
 
 ### Manually query Neptune (openCypher)
 
-Neptune does not expose a public endpoint. Access it from within the VPC (e.g., via a bastion, Cloud9, or a VPC-enabled Lambda):
+Neptune does not expose a public endpoint. Access it from within the VPC or via the API Gateway proxy:
+
+**Via Neptune proxy (from outside VPC):**
 
 ```bash
-# List all resource types in the graph
+# Requires neptune_create_proxy = true and awscurl (or any SigV4-capable client)
+PROXY_URL=$(terraform -chdir=terraform output -raw neptune_proxy_url)
+
+awscurl --service execute-api --region us-east-1 \
+  -X POST -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (n) RETURN labels(n), count(n) ORDER BY count(n) DESC LIMIT 20"}' \
+  "$PROXY_URL"
+```
+
+**Direct (from within VPC — bastion, Cloud9, or VPC-enabled Lambda):**
+
+```bash
 curl -X POST \
   "https://<NEPTUNE_ENDPOINT>:8182/openCypher" \
   -H "Content-Type: application/json" \
   -d '{"query": "MATCH (n) RETURN labels(n), count(n) ORDER BY count(n) DESC LIMIT 20"}'
 
-# Find dependencies of a specific resource
 curl -X POST \
   "https://<NEPTUNE_ENDPOINT>:8182/openCypher" \
   -H "Content-Type: application/json" \
@@ -138,9 +150,10 @@ The MCP server queries Neptune via SigV4-signed HTTP POST. These issues are spec
 
 ### Connection timeout from MCP server
 
-Neptune does not expose a public endpoint. The MCP server must reach the cluster on port 8182. Options:
+Neptune does not expose a public endpoint. Options:
 
-- **SSH tunnel**: `ssh -L 8182:<NEPTUNE_ENDPOINT>:8182 bastion-host` — then set `NEPTUNE_ENDPOINT=localhost` in the MCP config.
+- **Neptune proxy (recommended)**: Deploy the proxy (`neptune_create_proxy = true`), then set `NEPTUNE_PROXY_URL` in the MCP server environment. No VPC connectivity or tunnels needed.
+- **SSH tunnel**: `ssh -L 8182:<NEPTUNE_ENDPOINT>:8182 bastion-host` — then set `NEPTUNE_ENDPOINT=localhost` in the MCP config (SigV4 signing caveats apply).
 - **AWS Client VPN**: Connect to the VPC, then use the Neptune endpoint directly.
 - **Run from within VPC**: Deploy the MCP server on EC2/ECS in the same VPC.
 
@@ -194,8 +207,8 @@ The MCP server has a 30-second timeout. If Neptune is unreachable, the error mes
 - **"Index not found in region X … Found it in Y"** — the script scans supported regions and suggests the correct one.
 - **"Index is not ACTIVE"** — wait for Kendra to finish initialising; check the Kendra console.
 - **No results / empty output** — run `task pipeline:run` to ingest and sync.
-- **"NEPTUNE_ENDPOINT required for mode X"** — deploy Neptune (`create_neptune=true` + `task apply`) or use `MODE=kendra`.
-- **Neptune connection error in graph/combined mode** — Neptune is VPC-only; see "Neptune Query Troubleshooting" below.
+- **"NEPTUNE_ENDPOINT required for mode X"** — deploy Neptune (`create_neptune=true` + `task apply`) or use `MODE=kendra`. Alternatively, use `--neptune-proxy-url` if the proxy is deployed.
+- **Neptune connection error in graph/combined mode** — Neptune is VPC-only. Use `--neptune-proxy-url` from outside the VPC, or see "Neptune Query Troubleshooting" below for direct access options.
 
 ### Zero retrieval results
 

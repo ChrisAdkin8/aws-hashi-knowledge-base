@@ -30,11 +30,13 @@ terraform/
 │   │   ├── s3.tf                 # Graph staging S3 bucket
 │   │   ├── codebuild.tf          # CodeBuild project (VPC-enabled), security groups
 │   │   ├── sfn.tf                # Step Functions state machine, EventBridge scheduler, alarms
+│   │   ├── lambda.tf             # Neptune proxy: Lambda + API Gateway + IAM + SGs (opt-in)
+│   │   ├── lambda/neptune_proxy.py  # Lambda handler — SigV4-signs and forwards openCypher to Neptune
 │   │   ├── iam.tf                # CodeBuild, Step Functions, Scheduler roles
 │   │   ├── data.tf               # AWS data sources (aws_region, aws_caller_identity)
 │   │   ├── locals.tf             # Computed names
-│   │   ├── variables.tf          # Module inputs (vpc_id, subnet_ids, repo_uris, …)
-│   │   └── outputs.tf            # Neptune endpoints, state_machine_arn, staging_bucket_name, …
+│   │   ├── variables.tf          # Module inputs (vpc_id, subnet_ids, repo_uris, create_neptune_proxy, …)
+│   │   └── outputs.tf            # Neptune endpoints, neptune_proxy_url, state_machine_arn, …
 │   └── state-backend/            # KMS-encrypted S3 state bucket
 │       ├── main.tf               # S3 bucket with encryption, versioning, public access block
 │       ├── locals.tf             # Deterministic bucket name (account_id + sha256 suffix)
@@ -43,7 +45,7 @@ terraform/
 ├── main.tf                       # Calls both pipeline modules
 ├── variables.tf                  # All root-level inputs (region for provider; module-specific vars)
 ├── outputs.tf                    # Proxies all module outputs (Neptune outputs null-safe via try())
-└── versions.tf                   # required_version >= 1.10 < 1.15, aws ~> 5.100
+└── versions.tf                   # required_version >= 1.10 < 1.15, aws ~> 5.100, archive ~> 2.7
 ```
 
 ---
@@ -82,6 +84,7 @@ terraform/
 | Component | Role |
 |---|---|
 | **MCP Server** (`mcp/server.py`) | Bridges Claude Code to Kendra and Neptune via the Model Context Protocol; exposes `search_hashicorp_docs`, `get_resource_dependencies`, `find_resources_by_type`, and `get_index_info` tools |
+| **Neptune Proxy** (API Gateway + Lambda) | Optional (`create_neptune_proxy = true`). HTTP API with IAM auth fronting a VPC Lambda that SigV4-signs and forwards openCypher queries to Neptune. Allows the MCP server to reach Neptune from outside the VPC without tunnels. |
 | **Amazon Bedrock** | Hosts Claude models for AI inference — used at query time, not ingestion time |
 
 ### Supporting Infrastructure
@@ -179,6 +182,7 @@ GraphPipelineComplete
 | `graph-codebuild` | `codebuild.amazonaws.com` | `ec2:CreateNetworkInterface*` (VPC), `neptune-db:connect`, `s3:PutObject/GetObject` on staging bucket, `logs:*` |
 | `graph-step-functions` | `states.amazonaws.com` | `codebuild:StartBuild/BatchGetBuilds`, `logs:*` |
 | `graph-scheduler` | `scheduler.amazonaws.com` | `states:StartExecution` on the graph state machine ARN only |
+| `graph-neptune-proxy` | `lambda.amazonaws.com` | `neptune-db:connect`, `neptune-db:ReadDataViaQuery` (read-only), VPC networking, CloudWatch Logs. Created when `create_neptune_proxy = true`. |
 
 ---
 
@@ -238,6 +242,20 @@ Both feeds include full article HTML inline:
 | Backup retention | 7 days |
 
 The CodeBuild security group has an egress rule permitting port 8182 to the Neptune security group. No public access is exposed.
+
+### Neptune Proxy (Optional)
+
+When `create_neptune_proxy = true`, an API Gateway HTTP API + Lambda function is deployed to expose Neptune queries from outside the VPC:
+
+| Setting | Value |
+|---|---|
+| API Gateway | HTTP API, IAM authorization, `POST /query` route |
+| Lambda | Python 3.12, 256 MB, 30s timeout, VPC-attached (same subnets as Neptune) |
+| Security group | Egress to Neptune SG on port 8182; egress 443 for AWS APIs |
+| IAM | `neptune-db:connect` + `neptune-db:ReadDataViaQuery` (read-only) |
+| Authentication | Callers sign requests with SigV4 for `execute-api` service |
+
+The MCP server routes through the proxy when `NEPTUNE_PROXY_URL` is set, falling back to direct Neptune access otherwise.
 
 ---
 

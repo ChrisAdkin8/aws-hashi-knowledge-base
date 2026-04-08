@@ -60,6 +60,21 @@
 
 ---
 
+## Neptune Proxy (API Gateway + Lambda)
+
+- [x] terraform/modules/terraform-graph-store/lambda/neptune_proxy.py
+- [x] terraform/modules/terraform-graph-store/lambda.tf
+- [x] terraform/versions.tf (added archive provider)
+- [x] terraform/modules/terraform-graph-store/variables.tf (create_neptune_proxy)
+- [x] terraform/modules/terraform-graph-store/outputs.tf (neptune_proxy_url)
+- [x] terraform/variables.tf (neptune_create_proxy)
+- [x] terraform/main.tf (wired create_neptune_proxy)
+- [x] terraform/outputs.tf (neptune_proxy_url)
+- [x] mcp/server.py (NEPTUNE_PROXY_URL support)
+- [x] scripts/test_token_efficiency.py (--neptune-proxy-url)
+
+---
+
 ## CI
 
 - [x] .github/workflows/terraform.yml

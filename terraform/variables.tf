@@ -150,3 +150,9 @@ variable "graph_codebuild_compute_type" {
   type        = string
   default     = "BUILD_GENERAL1_MEDIUM"
 }
+
+variable "neptune_create_proxy" {
+  description = "Create an API Gateway + Lambda proxy for Neptune openCypher queries from outside the VPC."
+  type        = bool
+  default     = false
+}

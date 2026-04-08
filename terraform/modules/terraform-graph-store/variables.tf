@@ -115,6 +115,12 @@ variable "codebuild_private_subnet_cidr" {
   default     = "172.31.64.0/24"
 }
 
+variable "create_neptune_proxy" {
+  description = "Create an API Gateway + Lambda proxy for Neptune openCypher queries from outside the VPC."
+  type        = bool
+  default     = false
+}
+
 variable "codebuild_compute_type" {
   description = "CodeBuild compute type for the graph pipeline."
   type        = string

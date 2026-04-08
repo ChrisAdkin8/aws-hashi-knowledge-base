@@ -86,3 +86,8 @@ output "graph_codebuild_project_name" {
   description = "Name of the graph pipeline CodeBuild project."
   value       = try(module.terraform_graph_store[0].codebuild_project_name, null)
 }
+
+output "neptune_proxy_url" {
+  description = "API Gateway URL for the Neptune openCypher proxy (POST /query)."
+  value       = try(module.terraform_graph_store[0].neptune_proxy_url, null)
+}

@@ -46,7 +46,8 @@ Step Functions (8 states):
 | **AWS Step Functions** | 8-state ASL pipeline orchestrator. |
 | **Amazon EventBridge Scheduler** | Weekly cron trigger. |
 | **Amazon Bedrock** | Claude models used at **query time only** (not during ingestion). |
-| **MCP Server** (`mcp/server.py`) | Bridges Claude Code to Kendra via Model Context Protocol. |
+| **MCP Server** (`mcp/server.py`) | Bridges Claude Code to Kendra and Neptune via Model Context Protocol. |
+| **Neptune Proxy** (API Gateway + Lambda) | Optional (`create_neptune_proxy`). Exposes Neptune queries from outside the VPC via IAM-authenticated HTTP API. |
 | **CloudWatch + SNS** | Optional email alerts (controlled by `notification_email` variable). |
 | **GitHub Actions OIDC** | CI/CD federation (controlled by `create_github_oidc_provider` variable). |
 

@@ -32,5 +32,6 @@ module "terraform_graph_store" {
   codebuild_compute_type        = var.graph_codebuild_compute_type
   create_nat_gateway            = var.neptune_create_nat_gateway
   codebuild_private_subnet_cidr = var.neptune_codebuild_private_subnet_cidr
+  create_neptune_proxy          = var.neptune_create_proxy
   tags                          = var.tags
 }

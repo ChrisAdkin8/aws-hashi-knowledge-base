@@ -28,8 +28,8 @@ CodeBuild                  CodeBuild (per repo)
 S3 (RAG docs)              Amazon Neptune
     │                      (property graph)
     ▼                          │
-Amazon Kendra                  │
-(NLP index)                    │
+Amazon Kendra              API Gateway + Lambda
+(NLP index)                (Neptune proxy, opt-in)
     │                          │
     └──────────┬───────────────┘
                ▼
@@ -95,6 +95,7 @@ The graph pipeline runs `terraform plan -out=tfplan` in each workspace repo, ext
 - **jq** — `brew install jq`
 - **Amazon Bedrock model access** — enable Claude (e.g. `claude-sonnet-4-20250514`) in Bedrock console → Model access for AI inference via the MCP server
 - *(Neptune only)* An existing VPC with private subnets where CodeBuild can reach Neptune on port 8182
+- *(Neptune proxy only)* Set `neptune_create_proxy = true` to expose Neptune via API Gateway + Lambda for access from outside the VPC
 
 ---
 
@@ -204,6 +205,7 @@ The graph pipeline runs `terraform plan -out=tfplan` in each workspace repo, ext
 | `graph_repo_uris` | `[]` | GitHub HTTPS URLs of Terraform workspace repos to ingest into Neptune |
 | `graph_refresh_schedule` | `cron(0 3 ? * SUN *)` | EventBridge cron for the graph pipeline (UTC) |
 | `graph_codebuild_compute_type` | `BUILD_GENERAL1_MEDIUM` | CodeBuild compute type for graph pipeline |
+| `neptune_create_proxy` | `false` | Create an API Gateway + Lambda proxy for Neptune queries from outside the VPC |
 
 ---
 
@@ -329,6 +331,7 @@ print(response["output"]["message"]["content"][0]["text"])
 | **Amazon Kendra Enterprise Edition** | ~$1,400/month flat + $35/SCU/month for additional storage. Includes 10,000 queries/day. |
 | **Amazon Kendra Developer Edition** | ~$810/month, 10,000 document limit. Suitable for evaluation only. |
 | **Amazon Neptune** | ~$0.20–$0.35/hour per instance (`db.r6g.large`). Optional — only deployed when `create_neptune = true`. |
+| **Neptune Proxy (API Gateway + Lambda)** | API Gateway: per-request pricing; Lambda: per-invocation + compute. Optional — deployed when `neptune_create_proxy = true`. Negligible for MCP query volumes. |
 | **Amazon Bedrock** | Pay-per-token for Claude inference; negligible for query-time use |
 | **S3** | Storage for processed markdown and graph staging; negligible cost |
 | **CodeBuild** | Per-build-minute (`BUILD_GENERAL1_MEDIUM`); ~weekly runs |
