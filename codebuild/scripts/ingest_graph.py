@@ -40,11 +40,23 @@ def _clean_addr(raw: str) -> str:
     return addr.strip()
 
 
+def _leaf_addr(addr: str) -> str:
+    """Strip leading module.X. prefixes to get the leaf resource address."""
+    leaf = addr
+    while leaf.startswith("module."):
+        parts = leaf.split(".", 2)
+        if len(parts) < 3:
+            break
+        leaf = parts[2]
+    return leaf
+
+
 def _is_resource(addr: str) -> bool:
     """True if the address looks like a real resource (not a meta-node)."""
+    leaf = _leaf_addr(addr)
     skip = {"provider", "var.", "local.", "output.", "module.", "data."}
-    return any(addr.startswith(p) for p in ("aws_", "google_", "azurerm_")) or (
-        "." in addr and not any(addr.startswith(s) for s in skip)
+    return any(leaf.startswith(p) for p in ("aws_", "google_", "azurerm_", "vault_", "consul_", "nomad_", "hcp_")) or (
+        "." in leaf and not any(leaf.startswith(s) for s in skip)
     )
 
 
@@ -78,11 +90,12 @@ def parse_dot(dot_text: str):
     for raw_key, label in nodes.items():
         addr = label if label else _clean_addr(raw_key)
         if _is_resource(addr):
-            parts = addr.split(".", 1)
+            leaf = _leaf_addr(addr)
+            parts = leaf.split(".", 1)
             resource_nodes.append({
                 "id": addr,
-                "type": parts[0] if len(parts) == 2 else addr,
-                "name": parts[1] if len(parts) == 2 else addr,
+                "type": parts[0] if len(parts) == 2 else leaf,
+                "name": parts[1] if len(parts) == 2 else leaf,
             })
             resource_addrs.add(raw_key)  # keep raw key for edge mapping
 
