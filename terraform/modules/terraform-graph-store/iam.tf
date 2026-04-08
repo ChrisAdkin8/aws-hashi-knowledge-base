@@ -57,9 +57,16 @@ resource "aws_iam_role_policy" "codebuild" {
         }
       },
       {
-        # Neptune IAM auth — sign requests to the Neptune endpoint
-        Effect   = "Allow"
-        Action   = ["neptune-db:connect"]
+        # Neptune IAM auth — connect + data read/write for openCypher MERGE queries.
+        # neptune-db:connect is required for basic auth; ReadDataViaQuery and
+        # WriteDataViaQuery are required when Neptune FGAC is active (neptune1.4+).
+        Effect = "Allow"
+        Action = [
+          "neptune-db:connect",
+          "neptune-db:ReadDataViaQuery",
+          "neptune-db:WriteDataViaQuery",
+          "neptune-db:DeleteDataViaQuery",
+        ]
         Resource = ["arn:aws:neptune-db:${var.region}:${var.account_id}:${aws_neptune_cluster.main.cluster_resource_id}/*"]
       },
       {
