@@ -45,7 +45,23 @@ Amazon Kendra              API Gateway + Lambda
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed component tables, data flow, IAM design, and state machine internals.
 
-See [docs/diagrams/unified-data-layer.svg](docs/diagrams/unified-data-layer.svg) for the unified data layer diagram.
+### System Architecture
+
+End-to-end view of both pipelines, from EventBridge triggers through CodeBuild to the Kendra and Neptune backends, with the MCP serving layer that connects them to Claude Code.
+
+![System Architecture](docs/diagrams/architecture.svg)
+
+### Ingestion Pipeline
+
+Detailed flow of the docs ingestion pipeline: trigger and orchestration via Step Functions, parallel git-clone and API-fetch tracks, and post-processing into S3 and Kendra.
+
+![Ingestion Pipeline](docs/diagrams/ingestion_pipeline.svg)
+
+### Unified Data Layer
+
+How the MCP server unifies both backends — Kendra for semantic document search and Neptune for graph queries — behind a single tool interface consumed by Claude Code, Bedrock agents, or direct SDK calls.
+
+![Unified Data Layer](docs/diagrams/unified-data-layer.svg)
 
 ---
 
