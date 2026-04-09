@@ -155,7 +155,7 @@ The graph pipeline runs `terraform plan -out=tfplan` in each workspace repo, ext
 5. **Validate retrieval quality**
 
    ```bash
-   task pipeline:test
+   task docs:test
    ```
 
 6. *(Optional)* **Populate the graph database**
@@ -241,10 +241,10 @@ task claude:setup PERSIST=true                 # persist to ~/.bashrc
 ### Targeted pipeline runs
 
 ```bash
-task pipeline:run TARGET=blogs     # refresh blogs only
-task pipeline:run TARGET=discuss   # refresh Discuss threads only
-task pipeline:run TARGET=docs      # product repo documentation only
-task pipeline:run                  # full run (default)
+task docs:run TARGET=blogs     # refresh blogs only
+task docs:run TARGET=discuss   # refresh Discuss threads only
+task docs:run TARGET=docs      # product repo documentation only
+task docs:run                  # full run (default)
 ```
 
 Valid `TARGET` values: `all` (default), `docs`, `registry`, `discuss`, `blogs`.
@@ -304,19 +304,20 @@ print(response["output"]["message"]["content"][0]["text"])
 
 | Task | Description |
 |---|---|
-| `task up` | Full deploy: preflight → bootstrap → terraform apply → first pipeline run |
+| `task up` | Full deploy: preflight → bootstrap → terraform apply → populate Kendra + Neptune |
 | `task down` | Alias for `task destroy` |
 | `task destroy` | Destroy all Terraform-managed infrastructure |
 | `task login` | Verify AWS credentials |
 | `task bootstrap` | Create/verify remote state S3 bucket |
 | `task plan` | `terraform plan` (saves plan to `tfplan`) |
 | `task apply` | Interactive `terraform apply` (plan + confirm) |
-| `task pipeline:run` | Trigger a docs pipeline run and wait for completion |
-| `task pipeline:test` | Run retrieval validation queries against Kendra |
-| `task pipeline:status` | List last 5 docs pipeline executions |
-| `task pipeline:token-efficiency` | Compare token cost across backends (`MODE=kendra\|graph\|combined\|all`) |
+| `task docs:run` | Trigger a docs pipeline run and wait for completion |
+| `task docs:test` | Run retrieval validation queries against Kendra |
+| `task docs:status` | List last 5 docs pipeline executions |
+| `task test:token-efficiency` | Compare token cost across backends (`MODE=kendra\|graph\|combined\|all`) |
 | `task graph:populate` | Trigger a graph pipeline run and wait for completion |
 | `task graph:status` | List last 5 graph pipeline executions |
+| `task graph:test` | Validate Neptune graph has nodes and edges |
 | `task mcp:install` | Install MCP server dependencies |
 | `task mcp:setup` | Register MCP server with Claude Code |
 | `task mcp:test` | Smoke-test MCP server connectivity |

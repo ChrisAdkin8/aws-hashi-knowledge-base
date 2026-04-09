@@ -1,9 +1,9 @@
 resource "aws_s3_bucket" "graph_staging" {
   bucket        = local.staging_bucket_name
-  force_destroy = false
+  force_destroy = true
 
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }
 

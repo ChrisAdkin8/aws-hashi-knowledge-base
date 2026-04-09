@@ -25,16 +25,16 @@ Replace `REGION` with your deployment region (auto-detected from `terraform/terr
 
 ```bash
 # Full run (all content sources)
-task pipeline:run
+task docs:run
 
 # With explicit IDs if terraform output is unavailable
-task pipeline:run KENDRA_INDEX_ID=<INDEX_ID> KENDRA_DS_ID=<DATA_SOURCE_ID>
+task docs:run KENDRA_INDEX_ID=<INDEX_ID> KENDRA_DS_ID=<DATA_SOURCE_ID>
 
 # Targeted run — refresh a single content source
-task pipeline:run TARGET=blogs      # HashiCorp blog posts only
-task pipeline:run TARGET=discuss    # HashiCorp Discuss threads only
-task pipeline:run TARGET=docs       # product repo documentation only
-task pipeline:run TARGET=registry   # Terraform public registry modules only
+task docs:run TARGET=blogs      # HashiCorp blog posts only
+task docs:run TARGET=discuss    # HashiCorp Discuss threads only
+task docs:run TARGET=docs       # product repo documentation only
+task docs:run TARGET=registry   # Terraform public registry modules only
 ```
 
 Valid `TARGET` values: `all` (default), `docs`, `registry`, `discuss`, `blogs`.
@@ -42,7 +42,7 @@ Valid `TARGET` values: `all` (default), `docs`, `registry`, `discuss`, `blogs`.
 ### Check pipeline status
 
 ```bash
-task pipeline:status
+task docs:status
 ```
 
 Or directly:
@@ -56,20 +56,20 @@ aws stepfunctions list-executions \
 ### Validate retrieval quality
 
 ```bash
-task pipeline:test KENDRA_INDEX_ID=$(terraform -chdir=terraform output -raw kendra_index_id)
+task docs:test KENDRA_INDEX_ID=$(terraform -chdir=terraform output -raw kendra_index_id)
 ```
 
 ### Measure token efficiency
 
 ```bash
 # All modes (Kendra + graph + combined) — auto-detects IDs from Terraform
-task pipeline:token-efficiency
+task test:token-efficiency
 
 # Individual modes
-task pipeline:token-efficiency MODE=kendra     # Kendra RAG only
-task pipeline:token-efficiency MODE=graph      # Neptune graph only
-task pipeline:token-efficiency MODE=combined   # Both together
-task pipeline:token-efficiency MODE=all        # All three (default)
+task test:token-efficiency MODE=kendra     # Kendra RAG only
+task test:token-efficiency MODE=graph      # Neptune graph only
+task test:token-efficiency MODE=combined   # Both together
+task test:token-efficiency MODE=all        # All three (default)
 ```
 
 ### Re-ingest after adding new content sources
@@ -77,7 +77,7 @@ task pipeline:token-efficiency MODE=all        # All three (default)
 1. Update `codebuild/scripts/clone_repos.sh` or the appropriate fetch script.
 2. Update `codebuild/scripts/process_docs.py` if the new repo requires a custom `docs_subdirs` entry.
 3. Commit and push.
-4. Run `task pipeline:run` to trigger a full re-ingest.
+4. Run `task docs:run` to trigger a full re-ingest.
 
 ---
 
@@ -206,13 +206,13 @@ The MCP server has a 30-second timeout. If Neptune is unreachable, the error mes
 - **"Region X does not support Kendra"** — Supported regions: `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1`, `eu-west-2`, `ap-southeast-1`, `ap-southeast-2`, `ap-northeast-1`, `ap-northeast-2`, `ca-central-1`.
 - **"Index not found in region X … Found it in Y"** — the script scans supported regions and suggests the correct one.
 - **"Index is not ACTIVE"** — wait for Kendra to finish initialising; check the Kendra console.
-- **No results / empty output** — run `task pipeline:run` to ingest and sync.
+- **No results / empty output** — run `task docs:run` to ingest and sync.
 - **"NEPTUNE_ENDPOINT required for mode X"** — deploy Neptune (`create_neptune=true` + `task apply`) or use `MODE=kendra`. Alternatively, use `--neptune-proxy-url` if the proxy is deployed.
 - **Neptune connection error in graph/combined mode** — Neptune is VPC-only. Use `--neptune-proxy-url` from outside the VPC, or see "Neptune Query Troubleshooting" below for direct access options.
 
 ### Zero retrieval results
 
-1. Run `task pipeline:test KENDRA_INDEX_ID=<INDEX_ID>`.
+1. Run `task docs:test KENDRA_INDEX_ID=<INDEX_ID>`.
 2. Verify the last Kendra sync succeeded: Kendra console → Data sources → last sync status.
 3. Check that the S3 bucket contains documents for the missing product:
    ```bash
@@ -231,7 +231,7 @@ The MCP server has a 30-second timeout. If Neptune is unreachable, the error mes
 
 1. Change `kendra_edition` to `ENTERPRISE_EDITION` in `terraform/variables.tf`.
 2. Run `terraform -chdir=terraform apply -auto-approve` — destroys and recreates the index (10–30 minutes).
-3. Re-run `task pipeline:run` to re-sync all documents.
+3. Re-run `task docs:run` to re-sync all documents.
 
 ---
 
@@ -335,9 +335,9 @@ Commit and push. The next pipeline run will pick up the latest scripts — CodeB
 
 For products in `hashicorp/web-unified-docs` (Vault, Consul, Nomad, TFE, HCP Terraform):
 1. Add a REPO_CONFIG entry in `process_docs.py` with `"repo_dir": "web-unified-docs"` and the correct `docs_subdirs`.
-2. Commit, push, and run `task pipeline:run`.
+2. Commit, push, and run `task docs:run`.
 
 For products with their own GitHub repo:
 1. Add the repo to `clone_repos.sh` CORE_REPOS.
 2. Add a config entry in `process_docs.py` REPO_CONFIG with the appropriate `docs_subdirs`.
-3. Commit, push, and run `task pipeline:run`.
+3. Commit, push, and run `task docs:run`.

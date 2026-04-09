@@ -9,14 +9,15 @@ This repository provisions a high-precision Amazon Kendra RAG pipeline for the H
 | Category | Command |
 | :--- | :--- |
 | **Deploy** | `task up REPO_URI={url}` — REGION auto-detected from `terraform.tfvars` |
-| **Pipeline (full)** | `task pipeline:run` |
-| **Pipeline (targeted)** | `task pipeline:run TARGET=blogs` — `all`, `docs`, `registry`, `discuss`, `blogs` |
-| **Pipeline status** | `task pipeline:status` |
-| **Validation** | `task pipeline:test KENDRA_INDEX_ID={id}` |
-| **Token efficiency** | `task pipeline:token-efficiency` (auto-detects KENDRA_INDEX_ID from Terraform output) |
+| **Docs (full)** | `task docs:run` |
+| **Docs (targeted)** | `task docs:run TARGET=blogs` — `all`, `docs`, `registry`, `discuss`, `blogs` |
+| **Docs status** | `task docs:status` |
+| **Docs test** | `task docs:test` |
+| **Token efficiency** | `task test:token-efficiency` |
 | **Graph populate** | `task graph:populate GRAPH_REPO_URIS="https://github.com/org/repo"` |
 | **Graph status** | `task graph:status` |
-| **MCP Setup** | `task mcp:setup KENDRA_INDEX_ID={id}` (exposes RAG to Claude Code) |
+| **Graph test** | `task graph:test` |
+| **MCP Setup** | `task mcp:setup` (auto-detects IDs from Terraform output) |
 | **Claude Bedrock** | `task claude:setup` (routes Claude Code through Bedrock) |
 | **Terraform** | `task plan` \| `task apply` \| `task validate` \| `task destroy` |
 | **CI** | `task ci` (fmt:check + validate + shellcheck + tests) |
@@ -64,7 +65,7 @@ This repository provisions a high-precision Amazon Kendra RAG pipeline for the H
 
 * **Region**: Kendra is not available in all regions. Supported: `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1`, `eu-west-2`, `ap-southeast-1`, `ap-southeast-2`, `ap-northeast-1`, `ap-northeast-2`, `ca-central-1`. Bedrock Claude models require `us-west-2` or `us-east-1` for broadest availability.
 
-* **Kendra edition cannot be changed in-place**: Changing `kendra_edition` (DEVELOPER → ENTERPRISE or vice versa) destroys and recreates the Kendra index. Re-run `task pipeline:run` after to re-sync all documents.
+* **Kendra edition cannot be changed in-place**: Changing `kendra_edition` (DEVELOPER → ENTERPRISE or vice versa) destroys and recreates the Kendra index. Re-run `task docs:run` after to re-sync all documents.
 
 * **DEVELOPER_EDITION document limit**: Capped at 10,000 docs. This pipeline typically generates 10,000–30,000+ documents across all source types. Use `ENTERPRISE_EDITION` for production.
 
@@ -84,11 +85,11 @@ This repository provisions a high-precision Amazon Kendra RAG pipeline for the H
 
 2. **Apply infra changes**: `task plan && task apply`.
 
-3. **Re-sync index**: `task pipeline:run` (full) or `task pipeline:run TARGET=blogs` (targeted).
+3. **Re-sync index**: `task docs:run` (full) or `task docs:run TARGET=blogs` (targeted).
 
-4. **Validate**: `task pipeline:test KENDRA_INDEX_ID={id}` — verify all 10 topics return results.
+4. **Validate**: `task docs:test` — verify all 10 topics return results.
 
-5. **Check token efficiency**: `task pipeline:token-efficiency` — compares RAG retrieval token cost against pasting full documentation pages.
+5. **Check token efficiency**: `task test:token-efficiency` — compares RAG retrieval token cost against pasting full documentation pages.
 
 ---
 
@@ -102,7 +103,7 @@ This repository provisions a high-precision Amazon Kendra RAG pipeline for the H
 | Blog posts not fetched (0 files) | `hashicorp.com` is Cloudflare-protected — extract inline content from `<content>` (Atom) / `<content:encoded>` (RSS) tags |
 | `lxml` not installed | `BeautifulSoup(..., "xml")` requires lxml — `lxml>=5.0` is in `requirements.txt` |
 | Vault/Consul/Nomad missing from S3 | Individual product repos deprecated their `website/` trees — use `hashicorp/web-unified-docs` with `repo_dir` override in `REPO_CONFIG` |
-| Kendra edition change requires destroy | Edition cannot be changed in-place — `terraform destroy` + `terraform apply`, then re-run `task pipeline:run` |
+| Kendra edition change requires destroy | Edition cannot be changed in-place — `terraform destroy` + `terraform apply`, then re-run `task docs:run` |
 | `kendra_data_source_id` wrong format | `aws_kendra_data_source.s3.id` = `"<data_source_id>/<index_id>"` — use `split("/", ...)[0]` in locals |
 | `DEVELOPER_EDITION` document limit | Capped at 10,000 docs — use `ENTERPRISE_EDITION` for production |
 | GitHub Issues API rate limit | 60 req/hr unauthenticated — store token in Secrets Manager and uncomment the `secrets-manager` block in `buildspec.yml` |

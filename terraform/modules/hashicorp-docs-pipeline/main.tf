@@ -38,6 +38,11 @@ resource "aws_codebuild_project" "rag_pipeline" {
 
 # ── Step Functions State Machine ──────────────────────────────────────────────
 
+resource "time_sleep" "wait_for_sfn_role_propagation" {
+  depends_on      = [aws_iam_role_policy.step_functions]
+  create_duration = "30s"
+}
+
 resource "aws_sfn_state_machine" "rag_pipeline" {
   name     = "rag-hashicorp-pipeline"
   role_arn = aws_iam_role.step_functions.arn
@@ -46,7 +51,7 @@ resource "aws_sfn_state_machine" "rag_pipeline" {
     codebuild_project_name = aws_codebuild_project.rag_pipeline.name
   })
 
-  depends_on = [aws_iam_role_policy.step_functions]
+  depends_on = [time_sleep.wait_for_sfn_role_propagation]
 }
 
 # ── EventBridge Scheduler ─────────────────────────────────────────────────────

@@ -4,7 +4,7 @@ resource "aws_kendra_index" "main" {
   role_arn = aws_iam_role.kendra.arn
 
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 
   document_metadata_configuration_updates {
@@ -52,10 +52,7 @@ resource "aws_kendra_data_source" "s3" {
 
   configuration {
     s3_configuration {
-      bucket_name = aws_s3_bucket.rag_docs.id
-      # Use inclusion_patterns (not exclusion_patterns) so that .metadata.json
-      # sidecar files are not excluded from Kendra's metadata resolution pass.
-      # Excluding them causes "invalid metadata" errors at sync time.
+      bucket_name        = aws_s3_bucket.rag_docs.id
       inclusion_patterns = ["*.md"]
     }
   }

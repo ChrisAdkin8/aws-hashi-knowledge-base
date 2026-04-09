@@ -156,10 +156,10 @@ resource "aws_apigatewayv2_stage" "default" {
 }
 
 resource "aws_apigatewayv2_integration" "lambda_proxy" {
-  count              = var.create_neptune_proxy ? 1 : 0
-  api_id             = aws_apigatewayv2_api.neptune_proxy[0].id
-  integration_type   = "AWS_PROXY"
-  integration_uri    = aws_lambda_function.neptune_proxy[0].invoke_arn
+  count                  = var.create_neptune_proxy ? 1 : 0
+  api_id                 = aws_apigatewayv2_api.neptune_proxy[0].id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.neptune_proxy[0].invoke_arn
   payload_format_version = "2.0"
 }
 

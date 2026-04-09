@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# deploy.sh — End-to-end deploy orchestrator for the HashiCorp Bedrock RAG pipeline (Kendra backend).
+# deploy.sh — End-to-end deploy orchestrator for the HashiCorp RAG + Graph pipeline.
 #
 # Called by `task up`. Idempotent — safe to re-run.
 #
 # Steps:
 #   1. Bootstrap S3 state bucket
-#   2. terraform init + terraform apply (provisions all infra including Kendra index + data source)
-#   3. Trigger first pipeline run (unless --skip-pipeline)
+#   2. terraform init + terraform apply (provisions all infra)
+#   3. Populate Kendra — docs ingestion pipeline (unless --skip-pipeline)
+#   4. Populate Neptune — graph extraction pipeline (auto-detected, unless --skip-pipeline)
 #
 # Usage:
 #   scripts/deploy.sh --region us-east-1 --repo-uri https://github.com/org/repo
@@ -104,7 +105,7 @@ echo ""
 if [[ "${SKIP_PIPELINE}" == "true" ]]; then
   echo "Skipping pipeline run (--skip-pipeline set)."
 else
-  echo "==> Step 3: Trigger first pipeline run"
+  echo "==> Step 3: Populate Kendra (docs ingestion pipeline)"
   STATE_MACHINE_ARN=$(terraform -chdir="${TF_DIR}" output -raw state_machine_arn)
   KENDRA_INDEX_ID=$(terraform -chdir="${TF_DIR}" output -raw kendra_index_id)
   KENDRA_DS_ID=$(terraform -chdir="${TF_DIR}" output -raw kendra_data_source_id)
@@ -118,15 +119,50 @@ else
     --bucket-name         "${RAG_BUCKET}" \
     --repo-url            "${REPO_URI}" \
     --wait
+
+  # ── Step 4: Populate Neptune (graph extraction pipeline) ──────────────────
+  GRAPH_STATE_MACHINE_ARN=$(terraform -chdir="${TF_DIR}" output -raw graph_state_machine_arn 2>/dev/null || echo "")
+  if [[ -n "${GRAPH_STATE_MACHINE_ARN}" ]]; then
+    echo ""
+    echo "==> Step 4: Populate Neptune (graph extraction pipeline)"
+    NEPTUNE_ENDPOINT=$(terraform -chdir="${TF_DIR}" output -raw neptune_cluster_endpoint)
+    NEPTUNE_PORT=$(terraform -chdir="${TF_DIR}" output -raw neptune_port 2>/dev/null || echo "8182")
+    GRAPH_STAGING_BUCKET=$(terraform -chdir="${TF_DIR}" output -raw graph_staging_bucket_name)
+    REPO_URIS_RAW=$(grep graph_repo_uris "${TF_DIR}/terraform.tfvars" 2>/dev/null \
+      | grep -oE '"[^"]+"' | tr -d '"' | tr '\n' ' ' || echo "")
+
+    if [[ -z "${REPO_URIS_RAW}" ]]; then
+      echo "WARN: No graph_repo_uris in terraform.tfvars — skipping Neptune population."
+      echo "  Add graph_repo_uris to terraform.tfvars or run: task graph:populate GRAPH_REPO_URIS=\"...\""
+    else
+      bash scripts/run_graph_pipeline.sh \
+        --region               "${REGION}" \
+        --state-machine-arn    "${GRAPH_STATE_MACHINE_ARN}" \
+        --neptune-endpoint     "${NEPTUNE_ENDPOINT}" \
+        --neptune-port         "${NEPTUNE_PORT}" \
+        --graph-staging-bucket "${GRAPH_STAGING_BUCKET}" \
+        --repo-uris            "${REPO_URIS_RAW}"
+    fi
+  else
+    echo ""
+    echo "Neptune not deployed (create_neptune=false) — skipping graph pipeline."
+  fi
 fi
 
 echo ""
 echo "Deploy complete."
 KENDRA_INDEX_ID=$(terraform -chdir="${TF_DIR}" output -raw kendra_index_id)
-echo "Kendra Index ID: ${KENDRA_INDEX_ID}"
+NEPTUNE_ENDPOINT=$(terraform -chdir="${TF_DIR}" output -raw neptune_cluster_endpoint 2>/dev/null || echo "")
 echo ""
-echo "Validate retrieval:"
-echo "  task pipeline:test KENDRA_INDEX_ID=${KENDRA_INDEX_ID}"
+echo "── Populated backends ──────────────────────────────────────────"
+echo "  Kendra Index ID : ${KENDRA_INDEX_ID}"
+if [[ -n "${NEPTUNE_ENDPOINT}" ]]; then
+  echo "  Neptune endpoint: ${NEPTUNE_ENDPOINT}"
+fi
 echo ""
-echo "Set up MCP server for Claude Code:"
-echo "  task mcp:setup KENDRA_INDEX_ID=${KENDRA_INDEX_ID}"
+echo "Next steps:"
+echo "  task docs:test                     # validate Kendra retrieval"
+if [[ -n "${NEPTUNE_ENDPOINT}" ]]; then
+  echo "  task graph:test                    # validate Neptune graph data"
+fi
+echo "  task mcp:setup                     # register MCP server with Claude Code"

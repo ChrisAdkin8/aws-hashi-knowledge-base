@@ -139,9 +139,12 @@ resource "aws_iam_role" "step_functions" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "states.amazonaws.com" }
-      Action    = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = [
+        "states.amazonaws.com",
+        "events.amazonaws.com"
+      ] }
+      Action = "sts:AssumeRole"
     }]
   })
 }
@@ -179,10 +182,23 @@ resource "aws_iam_role_policy" "step_functions" {
           "events:DescribeRule",
           "events:DeleteRule",
           "events:RemoveTargets",
+          "events:ListRules",
+          "events:ListTargetsByRule",
         ]
-        Resource = [
-          "arn:aws:events:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:rule/StepFunctionsGetEventsForCodeBuildStartBuildRule"
-        ]
+        Resource = ["*"]
+      },
+      {
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = aws_iam_role.step_functions.arn
+        Condition = {
+          StringEquals = {
+            "iam:PassedToService" = [
+              "events.amazonaws.com",
+              "states.amazonaws.com"
+            ]
+          }
+        }
       },
     ]
   })

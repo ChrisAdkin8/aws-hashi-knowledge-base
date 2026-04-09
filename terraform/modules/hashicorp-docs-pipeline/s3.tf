@@ -3,7 +3,7 @@ resource "aws_s3_bucket" "rag_docs" {
   force_destroy = var.force_destroy
 
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }
 

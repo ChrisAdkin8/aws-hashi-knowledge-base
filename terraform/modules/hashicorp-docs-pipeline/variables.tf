@@ -11,7 +11,7 @@ variable "kendra_edition" {
 variable "force_destroy" {
   description = "Allow the RAG docs S3 bucket to be destroyed even if it contains objects. Set true only for non-production environments."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "refresh_schedule" {

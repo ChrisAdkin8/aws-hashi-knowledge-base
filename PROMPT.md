@@ -466,7 +466,7 @@ Naming convention: `path.name + ".metadata.json"` — this **preserves the `.md`
 | `DEVELOPER_EDITION` | ~$810 | 10,000 | Evaluation only — pipeline generates 10k–30k+ docs |
 | `ENTERPRISE_EDITION` | ~$1,400 + $35/SCU | 100,000/SCU | Production |
 
-Changing edition requires `terraform destroy` + `terraform apply`, then re-run `task pipeline:run`. It cannot be changed in-place.
+Changing edition requires `terraform destroy` + `terraform apply`, then re-run `task docs:run`. It cannot be changed in-place.
 
 ### S3 Data Source — `inclusion_patterns` vs `exclusion_patterns`
 
@@ -550,7 +550,7 @@ Kendra returns `product`, `product_family`, and `source_type` custom attributes 
 | `lxml` not installed | `BeautifulSoup(..., "xml")` requires lxml | `lxml>=5.0` in `requirements.txt`; installed in CodeBuild via pip |
 | Vault/Consul/Nomad missing from S3 | Individual product repos deprecated their `website/` trees | Use `hashicorp/web-unified-docs` with `repo_dir` override in `REPO_CONFIG` |
 | Clone failures silently swallowed | `\|\| { echo "WARN"; }` pattern in old `clone_repos.sh` | Hard-fail (`exit 1`) on `CORE_REPOS`; `clone_repo_optional()` for providers/sentinel |
-| Kendra edition change requires destroy | Edition (`DEVELOPER`/`ENTERPRISE`) cannot be changed in-place via Terraform | `terraform destroy` + `terraform apply`; re-run `task pipeline:run` |
+| Kendra edition change requires destroy | Edition (`DEVELOPER`/`ENTERPRISE`) cannot be changed in-place via Terraform | `terraform destroy` + `terraform apply`; re-run `task docs:run` |
 | `kendra_data_source_id` wrong format | `aws_kendra_data_source.s3.id` = `"<data_source_id>/<index_id>"` | Use `split("/", aws_kendra_data_source.s3.id)[0]` in locals |
 | `DEVELOPER_EDITION` document limit | Capped at 10,000 docs; pipeline generates 10k–30k+ | Use `ENTERPRISE_EDITION` for production |
 | GitHub Issues API rate limit | 60 req/hr unauthenticated | Set `GITHUB_TOKEN` in Secrets Manager |
