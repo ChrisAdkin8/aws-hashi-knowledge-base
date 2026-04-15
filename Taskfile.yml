@@ -1,12 +1,8 @@
 version: "3"
 
-# HashiCorp RAG + Graph Pipeline — Task runner
-#
-# Quick start:  task up REPO_URI=https://github.com/org/repo
-# Override:     REGION=us-west-2 (auto-detected from terraform.tfvars)
-
 vars:
   TF_DIR: terraform
+  TF: 'terraform -chdir={{.TF_DIR}}'
   PYTHON: .venv/bin/python3
   _REGION_FROM_TFVARS:
     sh: 'grep -m1 "^region" terraform/terraform.tfvars 2>/dev/null | awk -F"\"" "{print \$2}" || echo ""'
@@ -19,17 +15,26 @@ vars:
 tasks:
 
   default:
-    desc: "List available tasks"
-    cmds:
-      - task --list
+    silent: true
+    cmds: [task --list]
 
-  # ── Deploy ─────────────────────────────────────────────────────────────────
+  # ── Auth ───────────────────────────────────────────────────────────
+
+  login:
+    desc: Verify AWS credentials and print caller identity
+    preconditions: &aws
+      - sh: test -n "{{.ACCOUNT_ID}}"
+        msg: "No AWS credentials found. Run 'aws configure' or export AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY."
+    cmds:
+      - aws sts get-caller-identity
+      - 'echo "Region: {{.REGION}}"'
+
+  # ── Entrypoint ─────────────────────────────────────────────────────
 
   up:
     desc: "Full deploy: preflight → bootstrap → apply → populate Kendra + Neptune"
-    summary: "Idempotent. Required: REPO_URI. Optional: REGION, SKIP_PIPELINE=true"
-    requires:
-      vars: [REPO_URI]
+    preconditions: *aws
+    requires: { vars: [REPO_URI] }
     cmds:
       - task: preflight
       - |
@@ -39,80 +44,73 @@ tasks:
           {{if eq .SKIP_PIPELINE "true"}}--skip-pipeline{{end}}
 
   down:
-    desc: "Alias for destroy"
-    cmds:
-      - task: destroy
-
-  login:
-    desc: "Verify AWS credentials and print caller identity"
-    cmds:
-      - aws sts get-caller-identity
-      - 'echo "Region: {{.REGION}}"'
-
-  # ── Terraform ──────────────────────────────────────────────────────────────
+    desc: Alias for destroy
+    cmds: ['task destroy']
 
   bootstrap:
-    desc: "Create S3 state bucket via terraform/bootstrap (idempotent)"
+    desc: Create S3 state bucket via terraform/bootstrap (idempotent)
+    preconditions: *aws
     cmds:
-      - terraform -chdir={{.TF_DIR}}/bootstrap init -input=false
-      - terraform -chdir={{.TF_DIR}}/bootstrap apply -auto-approve -var="region={{.REGION}}"
-      - 'echo "State bucket: $(terraform -chdir={{.TF_DIR}}/bootstrap output -raw bucket_name)"'
+      - '{{.TF}} -chdir={{.TF_DIR}}/bootstrap init -input=false'
+      - '{{.TF}} -chdir={{.TF_DIR}}/bootstrap apply -auto-approve -var="region={{.REGION}}"'
+      - 'echo "State bucket: $({{.TF}} -chdir={{.TF_DIR}}/bootstrap output -raw bucket_name)"'
+
+  # ── Terraform ──────────────────────────────────────────────────────
+
+  fmt:
+    desc: Format Terraform files
+    cmds: ['{{.TF}} fmt -recursive']
+
+  fmt:check:
+    desc: Check Terraform formatting (CI)
+    cmds: ['{{.TF}} fmt -check -recursive']
 
   init:
-    desc: "Initialise Terraform with remote S3 backend"
+    desc: Initialise Terraform with remote S3 backend
+    preconditions: *aws
     cmds:
       - task: _tf-init
         vars: {INIT_FLAGS: "-reconfigure"}
+    status: ['test -f {{.TF_DIR}}/.terraform.lock.hcl']
 
   init:upgrade:
-    desc: "Re-initialise Terraform and upgrade providers"
+    desc: Re-initialise Terraform and upgrade providers
+    preconditions: *aws
     cmds:
       - task: _tf-init
         vars: {INIT_FLAGS: "-upgrade"}
 
-  fmt:
-    desc: "Format all Terraform files in-place"
-    cmds:
-      - terraform -chdir={{.TF_DIR}} fmt -recursive
-
-  fmt:check:
-    desc: "Check Terraform formatting (CI gate)"
-    cmds:
-      - terraform -chdir={{.TF_DIR}} fmt -check -recursive
-
   validate:
-    desc: "Run terraform validate"
+    desc: Run terraform validate
     deps: [init]
-    cmds:
-      - terraform -chdir={{.TF_DIR}} validate
+    cmds: ['{{.TF}} validate']
 
   plan:
-    desc: "Run terraform plan (saves to tfplan)"
+    desc: Plan and save to tfplan
     deps: [init]
-    cmds:
-      - terraform -chdir={{.TF_DIR}} plan -input=false -out=tfplan
+    cmds: ['{{.TF}} plan -input=false -out=tfplan']
 
   apply:
-    desc: "Interactive terraform apply"
+    desc: Plan then apply
+    deps: [plan]
     prompt: "Apply changes to AWS account {{.ACCOUNT_ID}}?"
-    cmds:
-      - terraform -chdir={{.TF_DIR}} apply -input=false
+    cmds: ['{{.TF}} apply tfplan']
 
   destroy:
-    desc: "Destroy all Terraform-managed infrastructure"
+    desc: Destroy all infrastructure
     deps: [init]
-    prompt: "Destroy ALL infrastructure in account {{.ACCOUNT_ID}}? This is irreversible."
+    prompt: "Destroy ALL infrastructure in account {{.ACCOUNT_ID}}? Irreversible."
+    silent: true
     cmds:
-      - terraform -chdir={{.TF_DIR}} destroy -auto-approve -input=false
+      - '{{.TF}} destroy -auto-approve -input=false'
 
   output:
-    desc: "Show Terraform outputs"
+    desc: Show Terraform outputs
     deps: [init]
-    cmds:
-      - terraform -chdir={{.TF_DIR}} output
+    cmds: ['{{.TF}} output']
 
   oidc:import:
-    desc: "Import existing GitHub OIDC provider into Terraform state"
+    desc: Import existing GitHub OIDC provider into Terraform state
     deps: [init]
     vars:
       OIDC_ARN:
@@ -123,18 +121,20 @@ tasks:
           echo "OIDC: provider not found — will be created by terraform apply."; exit 0
         fi
         STATE_ADDR="module.hashicorp_docs_pipeline.aws_iam_openid_connect_provider.github[0]"
-        if terraform -chdir={{.TF_DIR}} state show "${STATE_ADDR}" &>/dev/null; then
+        if {{.TF}} state show "${STATE_ADDR}" &>/dev/null; then
           echo "OIDC: already in state — nothing to do."
         else
           echo "OIDC: importing {{.OIDC_ARN}}..."
-          terraform -chdir={{.TF_DIR}} import "${STATE_ADDR}" "{{.OIDC_ARN}}"
+          {{.TF}} import "${STATE_ADDR}" "{{.OIDC_ARN}}"
         fi
 
-  # ── Docs (Kendra) ─────────────────────────────────────────────────────────
+  # ── Docs pipeline (Kendra) ────────────────────────────────────────
 
   docs:run:
     desc: "Populate Kendra — ingest docs (TARGET: all|docs|registry|discuss|blogs)"
     deps: [init]
+    silent: true
+    preconditions: *aws
     env:
       KENDRA_INDEX_ID: '{{.KENDRA_INDEX_ID}}'
       KENDRA_DS_ID: '{{.KENDRA_DS_ID}}'
@@ -158,8 +158,9 @@ tasks:
           --wait
 
   docs:test:
-    desc: "Validate Kendra retrieval with test queries"
+    desc: Validate Kendra retrieval with test queries
     deps: [init]
+    preconditions: *aws
     env:
       KENDRA_INDEX_ID: '{{.KENDRA_INDEX_ID}}'
     cmds:
@@ -172,16 +173,38 @@ tasks:
           --min-confidence "{{.MIN_CONFIDENCE | default "LOW"}}"
 
   docs:status:
-    desc: "Show the last 5 Kendra pipeline executions"
+    desc: Last 5 docs pipeline executions
     deps: [init]
+    silent: true
+    preconditions: *aws
     cmds:
       - task: _sfn:status
         vars: {TF_OUTPUT: state_machine_arn, LABEL: docs}
 
-  # ── Graph (Neptune) ────────────────────────────────────────────────────────
+  bucket:report:
+    desc: File counts per subfolder in RAG docs bucket
+    preconditions: *aws
+    silent: true
+    deps: [init]
+    vars:
+      RAG_BUCKET: { sh: '{{.TF}} output -raw rag_bucket_name 2>/dev/null' }
+    cmds:
+      - |
+        bucket="s3://{{.RAG_BUCKET}}"
+        printf "Bucket: %s\n\n%-40s %s\n%s\n" "$bucket" "Folder" "Files" "$(printf '─%.0s' {1..49})"
+        total=0
+        for folder in $(aws s3 ls "$bucket/" --region {{.REGION}} | awk '{print $NF}'); do
+          count=$(aws s3 ls --recursive "${bucket}/${folder}" --region {{.REGION}} 2>/dev/null | wc -l | tr -d ' ')
+          printf "%-40s %6d\n" "$folder" "$count"
+          total=$((total+count))
+        done
+        printf "\n%-40s %6d\n" "TOTAL" "$total"
+
+  # ── Graph pipeline (Neptune) ───────────────────────────────────────
 
   graph:populate:
-    desc: "Populate Neptune — extract Terraform graphs and load via openCypher"
+    desc: Trigger graph pipeline (terraform graph → Neptune) and wait
+    preconditions: *aws
     deps: [init]
     env:
       GRAPH_REPO_URIS: '{{.GRAPH_REPO_URIS}}'
@@ -200,7 +223,8 @@ tasks:
           --repo-uris            "$REPO_URIS"
 
   graph:test:
-    desc: "Validate Neptune graph has nodes and edges"
+    desc: Smoke-test Neptune graph (node/edge counts)
+    preconditions: *aws
     deps: [init]
     cmds:
       - |
@@ -209,56 +233,80 @@ tasks:
         scripts/test_graph.sh --proxy-url "$NEPTUNE_PROXY_URL"
 
   graph:status:
-    desc: "Show the last 5 Neptune pipeline executions"
+    desc: Last 5 graph pipeline executions
     deps: [init]
+    silent: true
+    preconditions: *aws
     cmds:
       - task: _sfn:status
         vars: {TF_OUTPUT: graph_state_machine_arn, LABEL: graph}
 
-  # ── Cross-backend tests ────────────────────────────────────────────────────
+  # ── Test ───────────────────────────────────────────────────────────
+
+  test:
+    desc: Python unit tests (pytest)
+    cmds:
+      - |
+        [[ -d codebuild/scripts/tests ]] || { echo "No tests yet."; exit 0; }
+        PY="{{.PYTHON}}"; [[ -x "$PY" ]] || PY="$(command -v python3)"
+        "$PY" -m pytest codebuild/scripts/tests -v
 
   test:token-efficiency:
     desc: "Compare retrieval token cost (MODE: kendra|graph|combined|all)"
+    silent: true
     deps: [init]
+    preconditions: *aws
     env:
       KENDRA_INDEX_ID: '{{.KENDRA_INDEX_ID}}'
     cmds:
       - |
+        set -euo pipefail
         eval "$(scripts/resolve_tf_outputs.sh {{.TF_DIR}})"
         MODE="{{.MODE | default "all"}}"
-        REGION="{{.REGION}}"
-        case "$MODE" in
-          kendra|graph|combined|all) ;;
-          *) echo "Error: MODE must be one of: kendra, graph, combined, all"; exit 1 ;;
-        esac
-        if [ "$MODE" = "kendra" ] || [ "$MODE" = "combined" ] || [ "$MODE" = "all" ]; then
-          if [ -z "$KENDRA_INDEX_ID" ]; then
-            echo "Error: KENDRA_INDEX_ID required for mode '$MODE'."
-            exit 1
-          fi
-        fi
-        if [ "$MODE" = "graph" ] || [ "$MODE" = "combined" ] || [ "$MODE" = "all" ]; then
-          if [ -z "$NEPTUNE_ENDPOINT" ] && [ -z "$NEPTUNE_PROXY_URL" ]; then
-            echo "Error: NEPTUNE_ENDPOINT or NEPTUNE_PROXY_URL required for mode '$MODE'. Deploy Neptune or use MODE=kendra."
-            exit 1
-          fi
-        fi
-        ARGS="--region $REGION --mode $MODE"
-        if [ -n "$KENDRA_INDEX_ID" ]; then ARGS="$ARGS --kendra-index-id $KENDRA_INDEX_ID"; fi
-        if [ -n "$NEPTUNE_ENDPOINT" ]; then ARGS="$ARGS --neptune-endpoint $NEPTUNE_ENDPOINT --neptune-port $NEPTUNE_PORT"; fi
-        if [ -n "$NEPTUNE_PROXY_URL" ]; then ARGS="$ARGS --neptune-proxy-url $NEPTUNE_PROXY_URL"; fi
+        case "$MODE" in kendra|graph|combined|all) ;; *) echo "Error: MODE must be kendra|graph|combined|all"; exit 1;; esac
+
+        ARGS="--region {{.REGION}} --mode $MODE"
+        [[ ! "$MODE" =~ ^(kendra|combined|all)$ ]] || {
+          [[ -n "${KENDRA_INDEX_ID:-}" ]] || { echo "Error: KENDRA_INDEX_ID required for mode '$MODE'."; exit 1; }
+          ARGS+=" --kendra-index-id $KENDRA_INDEX_ID"
+        }
+        [[ ! "$MODE" =~ ^(graph|combined|all)$ ]] || {
+          [[ -n "${NEPTUNE_ENDPOINT:-}" || -n "${NEPTUNE_PROXY_URL:-}" ]] || { echo "Error: NEPTUNE_ENDPOINT or NEPTUNE_PROXY_URL required for mode '$MODE'. Deploy Neptune or use MODE=kendra."; exit 1; }
+          [[ -z "${NEPTUNE_ENDPOINT:-}" ]] || ARGS+=" --neptune-endpoint $NEPTUNE_ENDPOINT --neptune-port $NEPTUNE_PORT"
+          [[ -z "${NEPTUNE_PROXY_URL:-}" ]] || ARGS+=" --neptune-proxy-url $NEPTUNE_PROXY_URL"
+        }
+        [[ "{{.VERBOSE | default ""}}" != "true" ]] || ARGS+=" --verbose"
         {{.PYTHON}} scripts/test_token_efficiency.py $ARGS
 
-  # ── MCP server ─────────────────────────────────────────────────────────────
+  # ── Preflight ──────────────────────────────────────────────────────
+
+  preflight:
+    desc: All preflight checks (tools, auth, packages, files, Terraform)
+    cmds: ['scripts/preflight.sh {{.REGION}} {{.PYTHON}} {{.TF_DIR}}']
+
+  # ── Claude Code ────────────────────────────────────────────────────
+
+  claude:setup:
+    desc: Configure Claude Code for Amazon Bedrock
+    preconditions: *aws
+    vars:
+      CLAUDE_REGION: '{{.CLAUDE_REGION | default "us-east-1"}}'
+      CLAUDE_MODEL: '{{.CLAUDE_MODEL | default "claude-sonnet-4-20250514"}}'
+    cmds:
+      - |
+        source scripts/setup_claude_bedrock.sh \
+          --region {{.CLAUDE_REGION}} --model {{.CLAUDE_MODEL}} \
+          {{if eq .PERSIST "true"}}--persist{{end}}
+
+  # ── MCP ────────────────────────────────────────────────────────────
 
   mcp:install:
-    desc: "Install MCP server dependencies into .venv"
-    cmds:
-      - "{{.PYTHON}} -m pip install -r mcp/requirements.txt --quiet"
-      - echo "MCP dependencies installed."
+    desc: Install MCP server dependencies
+    cmds: ['{{.PYTHON}} -m pip install -r mcp/requirements.txt --quiet && echo "MCP dependencies installed."']
 
   mcp:setup:
-    desc: "Register MCP server with Claude Code"
+    desc: Register MCP server with Claude Code
+    preconditions: *aws
     deps: [init]
     env:
       KENDRA_INDEX_ID: '{{.KENDRA_INDEX_ID}}'
@@ -271,7 +319,8 @@ tasks:
         scripts/setup_mcp.sh $ARGS
 
   mcp:test:
-    desc: "Smoke-test MCP server against live Kendra and Neptune"
+    desc: Smoke-test MCP server tools
+    preconditions: *aws
     deps: [init]
     env:
       KENDRA_INDEX_ID: '{{.KENDRA_INDEX_ID}}'
@@ -283,47 +332,21 @@ tasks:
         export NEPTUNE_ENDPOINT NEPTUNE_PORT NEPTUNE_IAM_AUTH=true
         {{.PYTHON}} mcp/test_server.py
 
-  # ── Claude Code / Bedrock ──────────────────────────────────────────────────
-
-  claude:setup:
-    desc: "Configure Claude Code to use Amazon Bedrock (CLAUDE_REGION, CLAUDE_MODEL, PERSIST)"
-    vars:
-      CLAUDE_REGION: '{{.CLAUDE_REGION | default "us-east-1"}}'
-      CLAUDE_MODEL: '{{.CLAUDE_MODEL | default "claude-sonnet-4-20250514"}}'
-    cmds:
-      - |
-        source scripts/setup_claude_bedrock.sh \
-          --region {{.CLAUDE_REGION}} --model {{.CLAUDE_MODEL}} \
-          {{if eq .PERSIST "true"}}--persist{{end}}
-
-  # ── CI ─────────────────────────────────────────────────────────────────────
-
-  ci:
-    desc: "Run all CI checks (fmt + validate + shellcheck + tests)"
-    cmds:
-      - task: fmt:check
-      - task: validate
-      - task: shellcheck
-      - task: test
+  # ── CI ─────────────────────────────────────────────────────────────
 
   shellcheck:
-    desc: "Lint all shell scripts"
+    desc: Lint shell scripts
     cmds:
-      - find scripts codebuild/scripts -name "*.sh" | xargs shellcheck
+      - |
+        files=$(git ls-files 'scripts/*.sh' 'codebuild/scripts/*.sh' 2>/dev/null)
+        : "${files:=$(ls scripts/*.sh codebuild/scripts/*.sh 2>/dev/null)}"
+        [[ -n "$files" ]] && shellcheck $files || echo "No shell scripts found."
 
-  test:
-    desc: "Run Python unit tests"
-    cmds:
-      - "{{.PYTHON}} -m pytest codebuild/scripts/tests/ -v"
+  ci:
+    desc: All CI checks
+    deps: [fmt:check, validate, shellcheck, test]
 
-  # ── Preflight ──────────────────────────────────────────────────────────────
-
-  preflight:
-    desc: "Run all preflight checks (tools, auth, packages, files, Terraform)"
-    cmds:
-      - scripts/preflight.sh {{.REGION}} {{.PYTHON}} {{.TF_DIR}}
-
-  # ── Internal helpers ───────────────────────────────────────────────────────
+  # ── Internal helpers ───────────────────────────────────────────────
 
   _tf-init:
     internal: true
@@ -332,7 +355,7 @@ tasks:
       - |
         BUCKET_REGION=$(aws s3api get-bucket-location --bucket {{.STATE_BUCKET}} --query LocationConstraint --output text 2>/dev/null || echo "{{.REGION}}")
         [ "$BUCKET_REGION" = "None" ] || [ -z "$BUCKET_REGION" ] && BUCKET_REGION="us-east-1"
-        terraform -chdir={{.TF_DIR}} init \
+        {{.TF}} init \
           -backend-config="bucket={{.STATE_BUCKET}}" \
           -backend-config="region=$BUCKET_REGION" \
           -input=false {{.INIT_FLAGS}}
@@ -341,7 +364,7 @@ tasks:
     internal: true
     cmds:
       - |
-        ARN=$(terraform -chdir={{.TF_DIR}} output -raw {{.TF_OUTPUT}} 2>/dev/null || echo "")
+        ARN=$({{.TF}} output -raw {{.TF_OUTPUT}} 2>/dev/null || echo "")
         if [ -z "${ARN}" ]; then
           echo "No {{.LABEL}} state machine found — has 'task apply' been run?"; exit 0
         fi

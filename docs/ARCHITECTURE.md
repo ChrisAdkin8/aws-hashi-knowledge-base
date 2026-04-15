@@ -1,51 +1,29 @@
-# Architecture — HashiCorp RAG + Graph Pipeline
+# Architecture
 
 ## Overview
 
-A production-grade system on AWS providing two complementary data pipelines and a unified retrieval layer:
+This repo provisions two complementary knowledge stores on AWS and exposes both through a single MCP server:
 
-1. **HashiCorp Docs Pipeline** — ingests HashiCorp product documentation into Amazon Kendra for NLP-powered semantic retrieval. No embedding model, vector database, or chunking configuration required.
-2. **Terraform Graph Store** — extracts Terraform resource dependency graphs from real workspaces via [rover](https://github.com/im2nguyen/rover) and loads them into Amazon Neptune (property graph database). This gives AI assistants a queryable model of real infrastructure topology.
-3. **Unified MCP Server** — a single Model Context Protocol server that routes queries to Kendra or Neptune depending on intent, merges results, and surfaces them to Claude Code.
+1. **Docs pipeline (Amazon Kendra)** — ingests HashiCorp's public documentation, GitHub issues, Discourse threads, and blog posts into an Amazon Kendra index for NLP-powered semantic retrieval. No embedding model, vector database, or chunking configuration required.
+2. **Graph store (Amazon Neptune)** — extracts Terraform resource dependency graphs from real workspaces via [rover](https://github.com/im2nguyen/rover) and loads them into Amazon Neptune (property graph database). This gives AI assistants a queryable model of real infrastructure topology. Opt-in via `create_graph_store = true`.
+
+Both pipelines share the same account, IAM model, Step Functions orchestrator, and EventBridge Scheduler cadence so the operational story is uniform.
 
 ---
 
-## Terraform Module Structure
+## Architecture Diagram
 
 ```
-terraform/
-├── bootstrap/                    # Separate root module — creates remote state bucket (local backend)
-│   └── main.tf                   # Calls modules/state-backend
-├── modules/
-│   ├── hashicorp-docs-pipeline/  # Kendra + ingestion pipeline
-│   │   ├── iam.tf                # Five IAM roles (least-privilege)
-│   │   ├── s3.tf                 # RAG docs S3 bucket
-│   │   ├── kendra.tf             # Kendra index + data source
-│   │   ├── locals.tf             # Computed names / IDs
-│   │   ├── data.tf               # AWS data sources (aws_region, aws_caller_identity)
-│   │   ├── variables.tf          # Module inputs (force_destroy, tags, …)
-│   │   └── outputs.tf            # kendra_index_id, rag_bucket_name, state_machine_arn, …
-│   ├── terraform-graph-store/    # Neptune + graph pipeline
-│   │   ├── main.tf               # Neptune cluster, instances, subnet/param groups
-│   │   ├── s3.tf                 # Graph staging S3 bucket
-│   │   ├── codebuild.tf          # CodeBuild project (VPC-enabled), security groups
-│   │   ├── sfn.tf                # Step Functions state machine, EventBridge scheduler, alarms
-│   │   ├── lambda.tf             # Neptune proxy: Lambda + API Gateway + IAM + SGs (opt-in)
-│   │   ├── nat.tf                # Optional NAT gateway for VPC-attached CodeBuild internet access
-│   │   ├── iam.tf                # CodeBuild, Step Functions, Scheduler roles
-│   │   ├── data.tf               # AWS data sources (aws_region, aws_caller_identity)
-│   │   ├── locals.tf             # Computed names
-│   │   ├── variables.tf          # Module inputs (vpc_id, subnet_ids, repo_uris, create_neptune_proxy, …)
-│   │   └── outputs.tf            # Neptune endpoints, neptune_proxy_url, state_machine_arn, …
-│   └── state-backend/            # KMS-encrypted S3 state bucket
-│       ├── main.tf               # S3 bucket with encryption, versioning, public access block
-│       ├── locals.tf             # Deterministic bucket name (account_id + sha256 suffix)
-│       ├── data.tf               # aws_caller_identity
-│       └── outputs.tf            # bucket_name, bucket_arn, backend_config
-├── main.tf                       # Calls both pipeline modules
-├── variables.tf                  # All root-level inputs (region for provider; module-specific vars)
-├── outputs.tf                    # Proxies all module outputs (Neptune outputs null-safe via try())
-└── versions.tf                   # required_version >= 1.10 < 1.15, aws ~> 5.100, archive ~> 2.7
+EventBridge Scheduler (weekly cron)
+        │
+        ▼
+Step Functions (orchestrator)
+        │
+        ├──► CodeBuild (clone repos → process markdown → upload to S3)
+        │
+        ├──► Amazon Kendra (sync data source from S3 into index)
+        │
+        └──► Validation (retrieval queries to confirm index health)
 ```
 
 ---
@@ -186,7 +164,7 @@ GraphPipelineComplete
 
 ---
 
-## Document Processing (Docs Pipeline)
+## Document Processing
 
 ### Semantic pre-splitting
 
@@ -203,7 +181,7 @@ CDKTF documentation is intentionally excluded:
 | Script | Mechanism |
 |---|---|
 | `process_docs.py` | `CDKTF_EXCLUDE_RE` drops files whose path contains `cdktf/`, `terraform-cdk/`, or `cdk-for-terraform/` |
-| `fetch_blogs.py` | Posts with CDKTF in the title or ≥3 CDKTF body mentions are skipped |
+| `fetch_blogs.py` | Posts with CDKTF in the title or >=3 CDKTF body mentions are skipped |
 | `fetch_discuss.py` | Threads with CDKTF in the title are skipped |
 | `fetch_github_issues.py` | Issues with CDKTF in the title are skipped |
 
@@ -226,7 +204,7 @@ Both feeds include full article HTML inline:
 | Sync schedule | On-demand (triggered by Step Functions after each CodeBuild run) |
 | Custom attributes | `product` (STRING), `product_family` (STRING), `source_type` (STRING) |
 
-> **Edition note:** `DEVELOPER_EDITION` is capped at 10,000 documents. This pipeline typically generates 10,000–30,000+ documents. The edition cannot be changed in-place — changing it destroys and recreates the index.
+> **Edition note:** `DEVELOPER_EDITION` is capped at 10,000 documents. This pipeline typically generates 10,000-30,000+ documents. The edition cannot be changed in-place — changing it destroys and recreates the index.
 
 ---
 
@@ -242,6 +220,13 @@ Both feeds include full article HTML inline:
 | Backup retention | 7 days |
 
 The CodeBuild security group has an egress rule permitting port 8182 to the Neptune security group. No public access is exposed.
+
+### Why Neptune (and not DynamoDB / OpenSearch / Neo4j)
+
+- **Managed property graph database.** Neptune is AWS's fully managed graph database — no cluster provisioning, patching, or backup management. Supports openCypher and Gremlin out of the box.
+- **openCypher query language** covers the dependency-walk queries the MCP layer needs (`MATCH (a)-[:DEPENDS_ON*1..N]->(b)`) without requiring a custom traversal engine.
+- **VPC-native.** Neptune runs inside a VPC with IAM authentication — no credentials to rotate, no public endpoints to secure. CodeBuild reaches it via VPC-attached builds.
+- **SigV4 authentication end-to-end.** IAM auth means no database passwords — the Neptune proxy Lambda signs requests with SigV4, and CodeBuild uses its execution role. No secrets to manage.
 
 ### Neptune Proxy (Optional)
 
@@ -266,11 +251,11 @@ The MCP server routes through the proxy when `NEPTUNE_PROXY_URL` is set, falling
 - `.sync` resource integration for CodeBuild — automatic poll via CloudWatch Events
 - Manual poll loop for Kendra sync (60-second wait between `ListDataSourceSyncJobs` calls)
 - Sequential `Map` state (`MaxConcurrency: 1`) for 10 validation queries — avoids Kendra throttling
-- Retry on `States.TaskFailed` for the CodeBuild step (2 retries, 30s interval, 2× backoff)
+- Retry on `States.TaskFailed` for the CodeBuild step (2 retries, 30s interval, 2x backoff)
 
 ### Graph pipeline ASL (`step-functions/graph_pipeline.asl.json`)
 
 - `Map` state with `MaxConcurrency: 3` — runs up to 3 repo ingestions concurrently
 - `.sync` CodeBuild integration per repo
-- Retry on `States.TaskFailed` (2 retries, 30s interval, 2× backoff)
+- Retry on `States.TaskFailed` (2 retries, 30s interval, 2x backoff)
 - Catch: routes to `PipelineFailed` state on unrecoverable errors

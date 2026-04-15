@@ -1,293 +1,379 @@
-# Operational Runbook — HashiCorp RAG + Graph Pipeline
+# Runbook — HashiCorp RAG Pipeline
 
-This runbook covers day-to-day operations, failure diagnosis, and recovery procedures for both the HashiCorp docs pipeline (Kendra) and the Terraform graph pipeline (Neptune).
+## Deployer IAM roles
+
+The authenticated IAM user (or role) running `task up` must hold the
+following permissions. These are the minimum required to create all resources
+managed by Terraform and the helper scripts.
+
+| IAM Policy / Permission | Why |
+|---|---|
+| `AmazonKendraFullAccess` | Create and manage Kendra index + data sources |
+| `AmazonS3FullAccess` | Create S3 buckets (state, RAG docs, graph staging) |
+| `AWSCodeBuildAdminAccess` | Create CodeBuild projects |
+| `AWSStepFunctionsFullAccess` | Create Step Functions state machines |
+| `AmazonEventBridgeSchedulerFullAccess` | Create EventBridge Scheduler schedules |
+| `IAMFullAccess` | Create IAM roles, policies, and OIDC providers |
+| `CloudWatchFullAccessV2` | Create alarms, dashboards, log groups |
+| `AmazonVPCFullAccess` | VPC/subnet/security-group for Neptune (when enabled) |
+| `NeptuneFullAccess` | Create Neptune cluster (when `create_neptune = true`) |
+| `SecretsManagerReadWrite` | Store GitHub token for elevated API rate limits |
+| `AWSLambda_FullAccess` | Create Neptune proxy Lambda (when `neptune_create_proxy = true`) |
+
+Grant all policies in one pass (replace `USERNAME`):
+
+```bash
+USERNAME=chris.adkin
+for policy in \
+  arn:aws:iam::policy/AmazonKendraFullAccess \
+  arn:aws:iam::policy/AmazonS3FullAccess \
+  arn:aws:iam::policy/AWSCodeBuildAdminAccess \
+  arn:aws:iam::policy/AWSStepFunctionsFullAccess \
+  arn:aws:iam::policy/AmazonEventBridgeSchedulerFullAccess \
+  arn:aws:iam::policy/IAMFullAccess \
+  arn:aws:iam::policy/CloudWatchFullAccessV2 \
+  arn:aws:iam::policy/AmazonVPCFullAccess \
+  arn:aws:iam::policy/NeptuneFullAccess \
+  arn:aws:iam::policy/SecretsManagerReadWrite \
+  arn:aws:iam::policy/AWSLambda_FullAccess; do
+  aws iam attach-user-policy --user-name "$USERNAME" --policy-arn "$policy"
+done
+```
+
+The preflight check (`task preflight`) verifies AWS credentials and basic
+access automatically — run it to catch missing permissions before deploying.
 
 ---
 
-## Quick Links
+## Initial deployment
 
-| Resource | Link pattern |
+The entire pipeline — infrastructure and first data ingestion — is deployed with a single command:
+
+```bash
+task up REPO_URI=https://github.com/my-org/aws-hashi-knowledge-base
+```
+
+`REGION` is auto-detected from `terraform/terraform.tfvars`. Override with `REGION=<region>` if needed (defaults to `us-east-1`).
+
+`task up` runs preflight checks first, then calls `scripts/deploy.sh`, which runs four idempotent steps:
+
+1. **Bootstrap** — creates the S3 state bucket and initialises Terraform remote backend.
+2. **Apply** — `terraform init` + `terraform apply` to provision all AWS resources (IAM roles, S3 bucket, Kendra index + data source, CodeBuild projects, Step Functions state machines, EventBridge Scheduler jobs, CloudWatch alarms).
+3. **Populate Kendra** — triggers the docs ingestion pipeline (unless `--skip-pipeline`).
+4. **Populate Neptune** — triggers the graph extraction pipeline if `create_neptune = true` is detected in Terraform outputs (unless `--skip-pipeline`).
+
+Re-running `task up` is safe — each step detects existing state and skips automatically.
+
+### Running preflight checks independently
+
+You can run all preflight checks without deploying:
+
+```bash
+task preflight
+```
+
+The preflight script validates CLI tools (terraform >= 1.5, aws, python3 >= 3.11, jq, shellcheck), AWS authentication and account access, Python packages, repository file integrity, and Terraform formatting/validation.
+
+### Re-deploying to a second environment
+
+```bash
+task up \
+  REGION=eu-west-1 \
+  REPO_URI=https://github.com/my-org/aws-hashi-knowledge-base
+```
+
+For a different environment, use a separate AWS account or Terraform workspace. Each environment gets its own Kendra index and S3 state bucket.
+
+---
+
+## Monitoring
+
+### Console Links
+
+Replace `REGION` with your deployment region.
+
+| Resource | URL |
 |---|---|
-| Step Functions | `https://console.aws.amazon.com/states/home?region=REGION#/statemachines` |
+| Step Functions executions | `https://console.aws.amazon.com/states/home?region=REGION#/statemachines` |
 | CodeBuild history | `https://console.aws.amazon.com/codesuite/codebuild/projects?region=REGION` |
-| CloudWatch Logs (docs CodeBuild) | `https://console.aws.amazon.com/cloudwatch/home?region=REGION#logsV2:log-groups/log-group/$252Faws$252Fcodebuild$252Frag-hashicorp-pipeline` |
+| CloudWatch Logs (docs) | `https://console.aws.amazon.com/cloudwatch/home?region=REGION#logsV2:log-groups/log-group/$252Faws$252Fcodebuild$252Frag-hashicorp-pipeline` |
 | Amazon Kendra | `https://console.aws.amazon.com/kendra/home?region=REGION` |
 | Amazon Neptune | `https://console.aws.amazon.com/neptune/home?region=REGION` |
 | S3 RAG bucket | `https://s3.console.aws.amazon.com/s3/buckets/hashicorp-rag-docs-REGION-SUFFIX` |
 
-Replace `REGION` with your deployment region (auto-detected from `terraform/terraform.tfvars`; defaults to `us-east-1` if not set).
+### Key Log Queries
 
----
-
-## Docs Pipeline Operations
-
-### Trigger a pipeline run manually
-
-```bash
-# Full run (all content sources)
-task docs:run
-
-# With explicit IDs if terraform output is unavailable
-task docs:run KENDRA_INDEX_ID=<INDEX_ID> KENDRA_DS_ID=<DATA_SOURCE_ID>
-
-# Targeted run — refresh a single content source
-task docs:run TARGET=blogs      # HashiCorp blog posts only
-task docs:run TARGET=discuss    # HashiCorp Discuss threads only
-task docs:run TARGET=docs       # product repo documentation only
-task docs:run TARGET=registry   # Terraform public registry modules only
+**Step Functions execution failures:**
+```
+fields @timestamp, @message
+| filter ispresent(execution_arn) and status = "FAILED"
+| sort @timestamp desc
+| limit 20
 ```
 
-Valid `TARGET` values: `all` (default), `docs`, `registry`, `discuss`, `blogs`.
-
-### Check pipeline status
-
-```bash
-task docs:status
+**CodeBuild failures:**
+```
+fields @timestamp, @message
+| filter @logStream like /rag-hashicorp-pipeline/
+| filter @message like /FAILED|Error|Exception/
+| sort @timestamp desc
+| limit 20
 ```
 
-Or directly:
-
-```bash
-aws stepfunctions list-executions \
-  --state-machine-arn $(terraform -chdir=terraform output -raw state_machine_arn) \
-  --max-results 5
+**Pipeline summary (process_docs output):**
 ```
-
-### Validate retrieval quality
-
-```bash
-task docs:test KENDRA_INDEX_ID=$(terraform -chdir=terraform output -raw kendra_index_id)
-```
-
-### Measure token efficiency
-
-```bash
-# All modes (Kendra + graph + combined) — auto-detects IDs from Terraform
-task test:token-efficiency
-
-# Individual modes
-task test:token-efficiency MODE=kendra     # Kendra RAG only
-task test:token-efficiency MODE=graph      # Neptune graph only
-task test:token-efficiency MODE=combined   # Both together
-task test:token-efficiency MODE=all        # All three (default)
-```
-
-### Re-ingest after adding new content sources
-
-1. Update `codebuild/scripts/clone_repos.sh` or the appropriate fetch script.
-2. Update `codebuild/scripts/process_docs.py` if the new repo requires a custom `docs_subdirs` entry.
-3. Commit and push.
-4. Run `task docs:run` to trigger a full re-ingest.
-
----
-
-## Graph Pipeline Operations
-
-### Trigger a graph population run
-
-```bash
-# Single repo
-task graph:populate GRAPH_REPO_URIS="https://github.com/org/infra-repo"
-
-# Multiple repos (space-separated)
-task graph:populate GRAPH_REPO_URIS="https://github.com/org/infra-repo https://github.com/org/app-repo"
-
-# Or set graph_repo_uris in terraform.tfvars and omit the override
-task graph:populate
-```
-
-The task starts the graph Step Functions state machine, waits for completion, and prints the execution status.
-
-### Check graph pipeline status
-
-```bash
-task graph:status
-```
-
-Or directly:
-
-```bash
-aws stepfunctions list-executions \
-  --state-machine-arn $(terraform -chdir=terraform output -raw graph_state_machine_arn) \
-  --max-results 5
-```
-
-### Manually query Neptune (openCypher)
-
-Neptune does not expose a public endpoint. Access it from within the VPC or via the API Gateway proxy:
-
-**Via Neptune proxy (from outside VPC):**
-
-```bash
-# Requires neptune_create_proxy = true and awscurl (or any SigV4-capable client)
-PROXY_URL=$(terraform -chdir=terraform output -raw neptune_proxy_url)
-
-awscurl --service execute-api --region us-east-1 \
-  -X POST -H "Content-Type: application/json" \
-  -d '{"query": "MATCH (n) RETURN labels(n), count(n) ORDER BY count(n) DESC LIMIT 20"}' \
-  "$PROXY_URL"
-```
-
-**Direct (from within VPC — bastion, Cloud9, or VPC-enabled Lambda):**
-
-```bash
-curl -X POST \
-  "https://<NEPTUNE_ENDPOINT>:8182/openCypher" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "MATCH (n) RETURN labels(n), count(n) ORDER BY count(n) DESC LIMIT 20"}'
-
-curl -X POST \
-  "https://<NEPTUNE_ENDPOINT>:8182/openCypher" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "MATCH (a)-[:DEPENDS_ON]->(b) WHERE a.address = \"aws_instance.web\" RETURN b.address, b.type"}'
+fields @timestamp, @message
+| filter @message like /files processed/
+| sort @timestamp desc
 ```
 
 ---
 
-## Neptune Query Troubleshooting (MCP Server)
+## Investigating a Failed Run — troubleshoot
 
-The MCP server queries Neptune via SigV4-signed HTTP POST. These issues are specific to the query path (not the ingestion pipeline).
+### Step 1 — Identify the failure point
 
-### Connection timeout from MCP server
+1. Open Step Functions in the Console.
+2. Find the failed execution.
+3. Click it and expand the step graph. The first red state is the failure point.
 
-Neptune does not expose a public endpoint. Options:
+### Step 2 — Check CodeBuild logs
 
-- **Neptune proxy (recommended)**: Deploy the proxy (`neptune_create_proxy = true`), then set `NEPTUNE_PROXY_URL` in the MCP server environment. No VPC connectivity or tunnels needed.
-- **SSH tunnel**: `ssh -L 8182:<NEPTUNE_ENDPOINT>:8182 bastion-host` — then set `NEPTUNE_ENDPOINT=localhost` in the MCP config (SigV4 signing caveats apply).
-- **AWS Client VPN**: Connect to the VPC, then use the Neptune endpoint directly.
-- **Run from within VPC**: Deploy the MCP server on EC2/ECS in the same VPC.
+If the failure is in a CodeBuild step:
 
-The MCP server has a 30-second timeout. If Neptune is unreachable, the error message explicitly mentions VPC connectivity.
+1. Note the build ID from the Step Functions execution details.
+2. Navigate to CodeBuild → Build history → find the build by ID.
+3. Expand the failing phase and read the CloudWatch logs.
 
-### SigV4 signature mismatch (403)
+Common build failures:
+- **`clone_repos.sh` timeout** — increase the CodeBuild step timeout or reduce the number of repos.
+- **`process_docs.py` crash** — a malformed markdown file caused an unhandled exception. Check logs for the filename.
+- **S3 upload permission denied** — the CodeBuild IAM role lacks `s3:PutObject` on the RAG bucket. Re-run `task apply` to reconcile IAM.
 
-- Confirm `NEPTUNE_IAM_AUTH=true` in the MCP server environment.
-- Verify that the AWS credentials have `neptune-db:connect` and `neptune-db:ReadDataViaQuery` permissions on the cluster.
-- The server uses form-encoded POST (`Content-Type: application/x-www-form-urlencoded`) with `parameters` as a JSON string — this is required for SigV4 payload hash to match.
+### Step 3 — Check Kendra sync errors
 
-### Empty results from `get_resource_dependencies`
+If the failure is in the `StartSync` or `ListSyncJobs` state:
 
-1. Verify the graph has been populated: `task graph:populate`.
-2. Check that the resource address format matches — the graph stores `aws_lambda_function.processor` not `module.foo.aws_lambda_function.processor` (module prefixes are stripped during ingestion).
-3. Use `find_resources_by_type` first to confirm the resource type exists in the graph.
+- **ResourceNotFoundException on data source** — the `kendra_data_source_id` Terraform output may be stale. Run `task output` and verify.
+- **AccessDeniedException** — the Kendra S3 role lacks `s3:GetObject` or `s3:ListBucket` on the RAG bucket.
+- **Invalid metadata sidecar** — a `.metadata.json` file is malformed. Check `generate_metadata.py` output.
 
-### Empty results from `find_resources_by_type`
+### Common Errors
 
-1. Run `task graph:status` to confirm the last pipeline run succeeded.
-2. Check that the repository containing those resources is in `graph_repo_uris`.
-3. Verify the resource type string matches exactly (e.g. `aws_iam_role` not `aws_iam_role_policy`).
+| Error | Cause | Fix |
+|---|---|---|
+| `Permission denied on S3 bucket` | CodeBuild role missing `s3:PutObject` | Re-run `task apply` to reconcile IAM |
+| `ResourceNotFoundException: Data source` | Kendra data source ID mismatch | Run `task output` and verify IDs; re-apply if stale |
+| `CodeBuild timeout` | Too many repos to clone within the timeout | Increase timeout or reduce repo count |
+| `GitHub API rate limit (403)` | Unauthenticated limit is 60 req/hr | Add `GITHUB_TOKEN` to Secrets Manager (see below) |
+| `Kendra index at capacity` | Developer Edition document limit reached | Switch `kendra_edition` to `ENTERPRISE_EDITION` and re-apply |
+| `Kendra sync failed — AccessDeniedException` | S3 role missing bucket permissions | Re-run `task apply` |
+| `Discourse rate limit (429)` | `fetch_discuss.py` hit discuss.hashicorp.com rate limit | Script retries automatically; increase `REQUEST_DELAY` if persistent |
+| `Blog fetch timeout` | `fetch_blogs.py` timed out | Increase step timeout or reduce page safety limit |
+| `Medium RSS empty` | `fetch_blogs.py` returned 0 SE posts | Check if `medium.com/feed/hashicorp-engineering` is still active |
+| `No markdown files found` | Repo changed its docs directory layout | Update `docs_subdirs` in `process_docs.py` |
+| `Region X does not support Kendra` | Kendra not available in that region | Use a supported region: `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1`, `eu-west-2`, `ap-southeast-1`, `ap-southeast-2`, `ap-northeast-1`, `ap-northeast-2`, `ca-central-1` |
 
 ---
 
-## Failure Diagnosis — Docs Pipeline
+## How to add a new provider
 
-### CodeBuild build failed
-
-1. Open CloudWatch Logs → `/aws/codebuild/rag-hashicorp-pipeline` and find the failing build stream.
-2. Common causes:
-   - **Git clone failure** — transient network issue; re-run the pipeline.
-   - **Python import error** — missing dependency; add to `codebuild/scripts/requirements.txt`.
-   - **S3 upload permission denied** — verify the CodeBuild IAM role has `s3:PutObject` on the RAG bucket.
-   - **GitHub rate limit** — unauthenticated API limit (60 req/hr); add `GITHUB_TOKEN` to Secrets Manager.
-   - **No markdown files found for a product** — the repo may have changed its docs directory layout; update `docs_subdirs` in `process_docs.py`.
-
-### Kendra sync failed
-
-1. In the Step Functions console, find the failed `StartSync` or `ListSyncJobs` state and expand its output.
-2. In the Kendra console → your index → Data sources → sync history, expand the failed sync for `FailureReasons`.
-3. Common causes:
-   - **ResourceNotFoundException on data source** — the `kendra_data_source_id` Terraform output may be stale. Run `terraform -chdir=terraform output` and verify `kendra_data_source_id` differs from `kendra_index_id`.
-   - **AccessDeniedException** — the Kendra S3 role lacks `s3:GetObject` or `s3:ListBucket` on the RAG bucket.
-   - **Invalid metadata sidecar** — a `.metadata.json` file is malformed. Check `generate_metadata.py` output.
-   - **Index capacity exceeded** — check the Kendra console → index metrics. Switch to Enterprise Edition if on Developer Edition.
-
-### Token efficiency task fails
-
-- **"Region X does not support Kendra"** — Supported regions: `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1`, `eu-west-2`, `ap-southeast-1`, `ap-southeast-2`, `ap-northeast-1`, `ap-northeast-2`, `ca-central-1`.
-- **"Index not found in region X … Found it in Y"** — the script scans supported regions and suggests the correct one.
-- **"Index is not ACTIVE"** — wait for Kendra to finish initialising; check the Kendra console.
-- **No results / empty output** — run `task docs:run` to ingest and sync.
-- **"NEPTUNE_ENDPOINT required for mode X"** — deploy Neptune (`create_neptune=true` + `task apply`) or use `MODE=kendra`. Alternatively, use `--neptune-proxy-url` if the proxy is deployed.
-- **Neptune connection error in graph/combined mode** — Neptune is VPC-only. Use `--neptune-proxy-url` from outside the VPC, or see "Neptune Query Troubleshooting" below for direct access options.
-
-### Zero retrieval results
-
-1. Run `task docs:test KENDRA_INDEX_ID=<INDEX_ID>`.
-2. Verify the last Kendra sync succeeded: Kendra console → Data sources → last sync status.
-3. Check that the S3 bucket contains documents for the missing product:
+1. Open `codebuild/scripts/clone_repos.sh`.
+2. Add an entry to the `PROVIDER_REPOS` associative array:
    ```bash
-   aws s3 ls s3://$(terraform -chdir=terraform output -raw rag_bucket_name)/documentation/ --region us-east-1
+   ["terraform-provider-<NAME>"]="https://github.com/hashicorp/terraform-provider-<NAME>.git"
    ```
-4. If a product folder is missing, check CloudWatch Logs for `No markdown files found in <repo>`.
-
-### Zero blog files in S3
-
-1. Check CloudWatch Logs for `fetch_blogs.py complete — 0 files written`.
-2. `fetch_blogs.py` reads content from RSS/Atom feed inline tags — it does **not** scrape article URLs.
-3. If feed URLs are failing, verify `https://www.hashicorp.com/blog/feed.xml` returns HTTP 200.
-4. If `lxml` is missing: verify `lxml>=5.0` is in `codebuild/scripts/requirements.txt`.
-
-### Kendra index at capacity (Developer Edition)
-
-1. Change `kendra_edition` to `ENTERPRISE_EDITION` in `terraform/variables.tf`.
-2. Run `terraform -chdir=terraform apply -auto-approve` — destroys and recreates the index (10–30 minutes).
-3. Re-run `task docs:run` to re-sync all documents.
+3. Open `codebuild/scripts/process_docs.py`.
+4. Add an entry to `REPO_CONFIG`:
+   ```python
+   "terraform-provider-<NAME>": {
+       "source_type": "provider",
+       "product": "<NAME>",
+       "docs_subdir": "website/docs",
+   },
+   ```
+5. Commit, push, and trigger the pipeline with `task docs:run`.
 
 ---
 
-## Failure Diagnosis — Graph Pipeline
+## How to Add a New HashiCorp Product Repo
 
-### Graph CodeBuild build failed
+For products in `hashicorp/web-unified-docs` (Vault, Consul, Nomad, TFE, HCP Terraform):
 
-1. Open CloudWatch Logs → `/aws/codebuild/graph-pipeline` and find the failing build stream.
-2. Common causes:
-   - **Terraform init/plan failed** — verify the workspace repo is accessible and the CodeBuild IAM role has permissions to read the repo (or that `GITHUB_TOKEN` is set if private).
-   - **rover not found** — check `codebuild/buildspec_graph.yml` installs rover from the expected URL.
-   - **Neptune connection refused** — verify CodeBuild's security group has port 8182 egress to the Neptune security group. Check the VPC config on the CodeBuild project.
-   - **IAM auth failure on Neptune** — confirm `neptune_iam_auth_enabled = true` and the CodeBuild role has `neptune-db:connect` and `neptune-db:*` data operation actions on the cluster resource ARN.
-   - **SigV4 signature mismatch (403 "signature we calculated does not match")** — the `ingest_graph.py` script must send Neptune openCypher requests using form-encoded `data=` with `parameters` as a JSON string, **not** `json=` body. The `requests-aws4auth` library computes different payload hashes for JSON vs form-encoded bodies, causing Neptune to reject the signature. Fix: use `data={"query": ..., "parameters": json.dumps(...)}` in the `requests.post()` call.
-   - **`ingest_graph.py` "No resource nodes found"** — `terraform graph` produced a DOT file with no nodes matching the resource filter. Check that the cloned repo has `.tf` files with real resources (not just module calls with `count = 0`).
+1. Add a `REPO_CONFIG` entry in `process_docs.py` with `"repo_dir": "web-unified-docs"` and the correct `docs_subdirs`.
+2. Commit, push, and run `task docs:run`.
 
-### Neptune cluster unavailable
+For products with their own GitHub repo:
 
-1. Check the Neptune console → cluster status. If `creating` or `modifying`, wait for it to become `available`.
-2. Verify the cluster is in the same VPC as the CodeBuild security group.
-3. Check the Neptune security group allows inbound on port 8182 from the CodeBuild security group.
+1. Add the repo to `clone_repos.sh` `CORE_REPOS`.
+2. Add a config entry in `process_docs.py` `REPO_CONFIG` with the appropriate `docs_subdirs`.
+3. Commit, push, and run `task docs:run`.
 
-### Graph pipeline not populating on schedule
+---
 
-1. Check the EventBridge scheduler: `aws scheduler get-schedule --name graph-weekly-refresh`.
-2. Verify the scheduler IAM role has `states:StartExecution` on the graph state machine ARN.
-3. Verify `graph_repo_uris` is non-empty in `terraform.tfvars` (an empty list causes the Map state to complete immediately with no builds).
+## How to Force a Full Re-import
 
-### EventBridge Scheduler not triggering (either pipeline)
+### Option A — Re-upload S3 objects and re-trigger
 
-1. `aws scheduler get-schedule --name rag-weekly-refresh` (or `graph-weekly-refresh`).
-2. Verify the scheduler IAM role has `states:StartExecution` on the correct state machine ARN.
-3. Look for `SchedulerInvocationError` events in CloudWatch.
+```bash
+aws s3 rm s3://$(terraform -chdir=terraform output -raw rag_bucket_name)/ --recursive
+task docs:run
+```
+
+### Option B — Delete and recreate the Kendra index
+
+Destroy and re-provision the index via Terraform:
+
+```bash
+# Destroy just the Kendra index (takes 10–30 minutes to recreate)
+terraform -chdir=terraform destroy -target=module.hashicorp_docs_pipeline.aws_kendra_index.main
+
+# Re-apply to recreate
+task apply
+
+# Trigger a fresh ingestion run
+task docs:run
+```
+
+---
+
+## How to Tune Chunking
+
+Chunks are defined by `codebuild/scripts/process_docs.py` before upload. Kendra applies its own document processing during sync.
+
+- **Section boundary**: change `MIN_SECTION_SIZE` (default 200 chars) to merge more or fewer small sections.
+- **Large-section split**: change the `max_chars` parameter in `_split_large_section` (default 2000 chars) to control how oversized sections are further split at code-fence boundaries.
+- **Code block compression**: `_compress_code_blocks()` strips comments and collapses blank lines inside fenced code blocks. Disable by removing the call in `process_file()` if you need verbatim code in chunks.
+
+After changing any of these, force a full re-import (see above) to apply to the index.
+
+---
+
+## How to Change the Kendra Edition
+
+Kendra offers two editions:
+
+- **Developer Edition** (~$810/month) — 750 queries/day, 10,000 documents.
+- **Enterprise Edition** (~$1,400/month) — 8,000 queries/day, 100,000 documents, higher availability.
+
+To switch:
+
+1. Edit `terraform/terraform.tfvars`:
+   ```hcl
+   kendra_edition = "ENTERPRISE_EDITION"
+   ```
+2. Run `task apply`.
+3. **Note:** Changing the edition destroys and recreates the Kendra index (10–30 minutes). All documents must be re-synced. Run `task docs:run` after apply completes.
 
 ---
 
 ## Cost Management
 
-### Pause the docs pipeline
+### Estimating costs
+
+| Component | Pricing basis | Estimate |
+|---|---|---|
+| Amazon Kendra (Enterprise) | Flat monthly | ~$1,400/month while index exists |
+| Amazon Kendra (Developer) | Flat monthly | ~$810/month while index exists |
+| S3 storage | Per GB-month | ~$0.023/GB/month |
+| CodeBuild | Per build-minute (general1.medium) | ~$0.005/min; expect 30–60 min/week |
+| Step Functions | Per state transition | Negligible for weekly runs |
+| EventBridge Scheduler | Per invocation | Negligible for weekly runs |
+| Neptune (db.r6g.large) | Per instance-hour | ~$0.348/hour (~$254/month) |
+| Neptune proxy (Lambda) | Per invocation + duration | Negligible at MCP query volumes |
+
+### Reducing costs
+
+- **Delete the Kendra index when not in use.** Set `force_destroy = true` in tfvars, then run `task destroy`. Kendra billing stops immediately.
+- **Use Developer Edition** if under 10,000 documents. Saves ~$590/month.
+- **Reduce clone frequency.** Change `refresh_schedule` from weekly to monthly if docs don't change often.
+- **Use a smaller CodeBuild machine type.** Switch `BUILD_COMPUTE_TYPE` if the build fits within the timeout.
+- **Filter repos.** Remove infrequently-updated repos from `clone_repos.sh`.
+- **Disable Neptune when not needed.** Set `create_neptune = false` and run `task apply` — the cluster and VPC resources are destroyed.
+
+### Monitoring costs
+
+Set up a budget alert in the AWS Billing console for the account. Use Cost Explorer with service-level filtering to see Kendra, S3, CodeBuild, and Neptune costs separately.
+
+---
+
+## Graph pipeline (Neptune)
+
+The graph pipeline is opt-in (`create_neptune = true` in `terraform.tfvars`) and provisioned by `terraform/modules/terraform-graph-store/`.
+
+### Enabling
+
+1. Edit `terraform/terraform.tfvars`:
+   ```hcl
+   create_neptune          = true
+   neptune_vpc_id          = "vpc-0123456789abcdef0"
+   neptune_subnet_ids      = ["subnet-aaa", "subnet-bbb"]
+   neptune_iam_auth_enabled = true
+   graph_repo_uris = [
+     "https://github.com/my-org/my-tf-workspace",
+     "https://github.com/my-org/another-workspace",
+   ]
+   ```
+2. `task apply` — provisions the Neptune cluster, security groups, CodeBuild project, Step Functions state machine, and EventBridge Scheduler job.
+3. `task graph:populate` — triggers a one-off run rather than waiting for the weekly cron.
+4. `task graph:test` — verifies that Neptune has nodes and edges.
+
+### Daily operations
+
+| Action | Command |
+|---|---|
+| Trigger an ad-hoc refresh | `task graph:populate` |
+| Smoke-test the store | `task graph:test` |
+| Inspect last 5 runs | `task graph:status` |
+| File counts in RAG bucket | `task bucket:report` |
+| Inspect counts from MCP | `mcp__hashicorp_rag__get_graph_info` |
+
+### Investigating a failed graph run
+
+1. `task graph:status` to find the failing execution.
+2. Open the Step Functions execution in the Console.
+3. Identify the failed Map iteration or CodeBuild step. Click into it to find the CodeBuild build ID.
+4. Open CodeBuild → Build history → that build, and read the phase logs:
+   - `install-terraform` failures: usually transient `releases.hashicorp.com` 5xx — re-trigger.
+   - `clone-workspace` failures: the workspace repo is private or the URL is wrong. Add a deploy key or fix the URL.
+   - `terraform-graph` failures: missing provider plugin or backend block that doesn't strip cleanly. Check the strip-backend regex in `codebuild/buildspec_graph.yml`.
+   - `ingest-graph` failures: usually IAM or VPC connectivity. The CodeBuild role needs `neptune-db:connect` and `neptune-db:*` data actions on the cluster ARN, and the security group must allow port 8182.
+
+### Common errors
+
+| Error | Cause | Fix |
+|---|---|---|
+| `graph_repo_uris is empty` | The variable is empty | Set `graph_repo_uris` in tfvars and re-apply |
+| `neptune-db:connect AccessDeniedException` | CodeBuild role missing Neptune IAM permissions | Re-run `task apply` |
+| `Connection refused on port 8182` | CodeBuild security group cannot reach Neptune | Verify VPC config and security group rules in Terraform |
+| `SigV4 signature mismatch (403)` | `ingest_graph.py` using `json=` body instead of form-encoded `data=` | Use `data={"query": ..., "parameters": json.dumps(...)}` in `requests.post()` |
+| `No resource nodes found` | `terraform graph` produced DOT with no matching nodes | Check that the cloned repo has `.tf` files with real resources |
+| `Neptune cluster unavailable` | Cluster is `creating` or `modifying` | Wait for `available` status in the Neptune console |
+| `parse error in buildspec` | Malformed YAML in `buildspec_graph.yml` | Validate the buildspec syntax |
+
+### Re-ingesting a single repo
+
+The pipeline is authoritative per `repo_uri`: each ingestion run deletes existing nodes/edges for that repo before inserting fresh data. To force a clean re-ingest of one repo, trigger the state machine with just that repo in `graph_repo_uris`:
 
 ```bash
-aws scheduler update-schedule \
-  --name rag-weekly-refresh \
-  --state DISABLED \
-  --schedule-expression "cron(0 2 ? * SUN *)" \
-  --flexible-time-window '{"Mode":"OFF"}' \
-  --target "{\"Arn\":\"$(terraform -chdir=terraform output -raw state_machine_arn)\",\"RoleArn\":\"SCHEDULER_ROLE_ARN\"}"
+task graph:populate GRAPH_REPO_URIS="https://github.com/org/single-repo"
 ```
 
-### Full teardown
+### Neptune query access
 
-```bash
-task destroy
-```
+Neptune does not expose a public endpoint. Options for querying from outside the VPC:
 
-> **Warning:** This destroys all Terraform-managed resources including the Kendra index, Neptune cluster (if deployed), S3 buckets, CodeBuild projects, Step Functions state machines, and EventBridge schedulers. The S3 buckets have `prevent_destroy = true` in the Terraform lifecycle — you must set `force_destroy = true` first if they contain objects.
+- **Neptune proxy (recommended)**: Deploy the Lambda proxy (`neptune_create_proxy = true`), then use the proxy URL. No VPC connectivity needed.
+- **SSH tunnel**: `ssh -L 8182:<NEPTUNE_ENDPOINT>:8182 bastion-host`.
+- **AWS Client VPN**: Connect to the VPC, then use the Neptune endpoint directly.
+
+The MCP server uses SigV4-signed HTTP POST. Ensure `NEPTUNE_IAM_AUTH=true` and that credentials have `neptune-db:connect` and `neptune-db:ReadDataViaQuery` permissions.
+
+### Cost notes
+
+- Neptune is the only continuously-billed graph resource. A single `db.r6g.large` instance is roughly **$254/month**.
+- To pause Neptune billing, set `create_neptune = false` and run `task apply` — the cluster and associated VPC resources are destroyed (subject to `neptune_deletion_protection`; set to `false` first if needed).
+- DOT snapshots are stored in the graph staging bucket with a lifecycle delete policy.
 
 ---
 
@@ -303,41 +389,3 @@ aws secretsmanager create-secret \
 ```
 
 Uncomment the `secrets-manager` block in `codebuild/buildspec.yml` to activate it. No other changes required.
-
----
-
-## Updating the Pipeline
-
-### Terraform changes
-
-```bash
-task plan    # review proposed changes
-task apply   # apply
-```
-
-### CodeBuild script changes
-
-Commit and push. The next pipeline run will pick up the latest scripts — CodeBuild clones this repository fresh on every build using the `REPO_URL` environment variable.
-
-### Adding a new Terraform workspace to the graph pipeline
-
-1. Add the repo URL to `graph_repo_uris` in `terraform/terraform.tfvars`.
-2. Run `task apply` to update the Step Functions input.
-3. Run `task graph:populate` to ingest immediately.
-
-### Adjusting content exclusions (docs pipeline)
-
-- **Docs paths** — edit `CDKTF_EXCLUDE_RE` in `process_docs.py`
-- **Blog posts** — edit `_CDKTF_RE` and the body mention threshold (currently 3) in `fetch_blogs.py`
-- **Discuss threads / GitHub issues** — edit `_CDKTF_RE` in `fetch_discuss.py` / `fetch_github_issues.py`
-
-### Adding new product documentation
-
-For products in `hashicorp/web-unified-docs` (Vault, Consul, Nomad, TFE, HCP Terraform):
-1. Add a REPO_CONFIG entry in `process_docs.py` with `"repo_dir": "web-unified-docs"` and the correct `docs_subdirs`.
-2. Commit, push, and run `task docs:run`.
-
-For products with their own GitHub repo:
-1. Add the repo to `clone_repos.sh` CORE_REPOS.
-2. Add a config entry in `process_docs.py` REPO_CONFIG with the appropriate `docs_subdirs`.
-3. Commit, push, and run `task docs:run`.

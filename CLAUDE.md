@@ -1,11 +1,11 @@
-# CLAUDE.md — Project Instructions for Claude Code
+# CLAUDE.md - Project Instructions for Claude Code
 
 ## Build & Test Commands
 
 ```bash
 task ci                # all CI checks: fmt:check + validate + shellcheck + tests
-task plan              # terraform plan
-task apply             # terraform apply (interactive confirm)
+task plan              # terraform plan (saves to tfplan)
+task apply             # plan then apply (interactive confirm)
 task docs:test         # validate Kendra retrieval (10 test queries)
 task graph:test        # validate Neptune graph has nodes/edges
 task test              # Python unit tests (pytest)
@@ -23,12 +23,24 @@ task fmt:check         # check Terraform formatting (no writes)
 
 ## AWS Constraints (Hard Failures)
 
-- **Kendra S3 data source**: must use `s3_configuration` with `inclusion_patterns = ["**/*.md"]`. Do NOT use `exclusion_patterns` (blocks `.metadata.json` sidecars) or `template_configuration` (invalid for S3 type, fails with `S3ConnectorConfiguration` error)
-- **Kendra edition**: cannot be changed in-place. Changing `kendra_edition` destroys and recreates the index
-- **Security group descriptions**: ASCII only. No em dashes, smart quotes, or other non-ASCII characters — EC2 rejects them with `InvalidParameterValue`
-- **Lambda env vars**: never set `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, or other reserved keys. Lambda injects them at runtime. Setting them causes `InvalidParameterValueException`
-- **Neptune SigV4 signing**: use `botocore.auth.SigV4Auth` + `botocore.awsrequest.AWSRequest`, NOT `requests-aws4auth`. The third-party library produces signature mismatches with Neptune's openCypher endpoint
-- **Step Functions `.sync` integrations**: the execution role must trust both `states.amazonaws.com` AND `events.amazonaws.com`, and `iam:PassRole` must allow both services. Missing either causes `AccessDeniedException: not authorized to create managed-rule`
+- **Kendra S3 data source**: must use `s3_configuration` with
+  `inclusion_patterns = ["**/*.md"]`. Do NOT use `exclusion_patterns` (blocks
+  `.metadata.json` sidecars) or `template_configuration` (invalid for S3 type,
+  fails with `S3ConnectorConfiguration` error).
+- **Kendra edition**: cannot be changed in-place. Changing `kendra_edition`
+  destroys and recreates the index.
+- **Security group descriptions**: ASCII only. No em dashes, smart quotes, or
+  other non-ASCII characters — EC2 rejects them with `InvalidParameterValue`.
+- **Lambda env vars**: never set `AWS_REGION`, `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, or other reserved keys. Lambda injects them at
+  runtime. Setting them causes `InvalidParameterValueException`.
+- **Neptune SigV4 signing**: use `botocore.auth.SigV4Auth` +
+  `botocore.awsrequest.AWSRequest`, NOT `requests-aws4auth`. The third-party
+  library produces signature mismatches with Neptune's openCypher endpoint.
+- **Step Functions `.sync` integrations**: the execution role must trust both
+  `states.amazonaws.com` AND `events.amazonaws.com`, and `iam:PassRole` must
+  allow both services. Missing either causes `AccessDeniedException: not
+  authorized to create managed-rule`.
 
 ## Architecture (Key Facts)
 
